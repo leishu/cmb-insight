@@ -8,10 +8,13 @@
 
 | 工具 | 说明 |
 |---|---|
-| `get_overview` | 数据口径与总量 |
+| `get_overview` | 数据口径与总量，含**数据体检**（缺月、低覆盖月、解析失败） |
 | `aggregate` | 按年月/星期/小时/类型/渠道/商户/卡号/金额区间聚合 |
 | `top_merchants` | 商户排行 |
-| `search_transactions` | 明细检索（FTS5 全文索引） |
+| `compare` | **环比/同比**：本期 vs 上期或去年同期，给出差额、变化率与「主要变动项」 |
+| `subscriptions` | **周期扣款识别**：间隔规律 + 金额稳定，折合月/年成本、下次预计扣款 |
+| `search_transactions` | 明细检索（FTS5 全文索引，≥3 字走 trigram，短词退化为 LIKE） |
+| `bills` | **账本级**：信用额度、本期应还、最低还款、到期日、本期消费/退款、利息、对账差额、额度使用率 |
 | `run_sql` | 只读 SQL 查询（SELECT / WITH） |
 | `render_chart` | 返回 PNG 柱状图，可直接嵌在回答中 |
 | `open_dashboard` | 打开 Vue3 + ECharts 面板（可交互） |
@@ -188,7 +191,7 @@ python3 mcp/db.py --stats data/cmb.db                    # 核对笔数
 装好的三个标志：
 
 - 「技能」列表里出现 **招商银行消费洞察**；
-- 「MCP 服务管理 → 我的 MCP」里 `cmb-insight` 显示 **7/7 个工具已启用**；
+- 「MCP 服务管理 → 我的 MCP」里 `cmb-insight` 显示 **10/10 个工具已启用**；
 - `~/.workbuddy/plugins/data/cmb-insight-cmb-local/` 被创建出来（应用注入的插件数据目录，也是确认「真的加载了」的硬证据）。
 
 连不上时该页面有 **重连** 按钮，比重启应用快。
@@ -251,6 +254,8 @@ EOF
 
 ```
 今年招行花了多少，按类型拆一下
+这期账单该还多少、什么时候到期
+我现在的额度用了多少
 打开招行面板
 ```
 或输入 `/招行面板`。
@@ -286,9 +291,10 @@ python3 mcp/db.py --sql data/cmb.db "SELECT month, net_amount FROM v_monthly ORD
 cmb-insight/
 ├── .codebuddy-plugin/plugin.json   插件清单（声明 MCP / skills / commands）
 ├── install.sh                      一键注册到本地市场（macOS / Linux）
+├── SCHEMA.md                       数据库逐列说明（表/列/枚举/口径陷阱）
 ├── data/cmb.db                     SQLite 库（本地生成，不入库）
 ├── mcp/
-│   ├── db.py                       建表 + 导入 + 查询层（核心）
+│   ├── db.py                       建表 + 导入 + 查询层（核心，schema v4）
 │   ├── cmb_parse.py                .eml → 交易记录（版式 A/B 解析）
 │   ├── server.py                   MCP 服务端（stdio，零依赖）
 │   ├── launch.sh                   启动器：探测 Python 解释器后 exec（macOS/Linux）
@@ -296,7 +302,7 @@ cmb-insight/
 │   └── chart_png.py                零依赖 PNG 柱状图
 ├── dashboard/                      Vue3 + ECharts 面板源码
 │   ├── src/App.vue                 布局、筛选、联动、播放
-│   ├── src/components/             BaseChart / Trend / KindBars / RankBar / HeatMap / Hist / TxTable
+│   ├── src/components/             BaseChart / Trend / KindBars / RankBar / HeatMap / Hist / TxTable / BillPanel
 │   ├── src/logic/aggregate.js      前端聚合与格式化
 │   └── dist/index.html             构建产物（单文件，随仓库提供；server 注入数据后用）
 ├── skills/cmb-consumption-insight/ 技能说明
@@ -322,26 +328,57 @@ python3 mcp/db.py --stats data/cmb.db
 python3 mcp/db.py --sql data/cmb.db "SELECT month, net_amount FROM v_monthly ORDER BY month DESC LIMIT 6"
 ```
 
+> 库结构升级（`SCHEMA_VERSION` 变了）时，上面第一条命令会自动转成全量重建，不用手动加 `--rebuild`；
+> 数据全部由 `.eml` 复现，重建不会丢东西，只是多花二十来秒。
+
 ### 表结构
+
+> **逐列说明见 [SCHEMA.md](SCHEMA.md)**：5 张表（`mail` / `tx` / `hold` / `bill` / `credit`）加 `meta`、
+> `tx_fts`、4 个视图的字段含义、枚举取值、空值语义、口径陷阱和常用查询都在那一份文档里。
+> 这里只留一张速查清单。
 
 ```
 mail(id, file, subject, mail_time, mail_date, category, size_bytes,
-     tx_count, bill_amount, body_text)
+     tx_count, bill_amount, body_text, imported_at)
 tx(id, mail_id, card, tx_date, tx_time, month, year, dow, hour,
-   kind, channel, merchant, amount, sign, signed_amount, layout)
+   kind, channel, merchant, amount, sign, signed_amount, layout, state)
+hold(id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout)
+bill(id, mail_id, bill_month, cycle_start, cycle_end, due_date, credit_limit,
+     due_amount, min_amount, prev_balance, payment, debits, credits, interest, layout)
+credit(id, mail_id, dt, avail_credit, limit_credit, points, card)
+meta(key, value)
+tx_fts(merchant, channel, subject)          -- FTS5 trigram，rowid = tx.id
 ```
 
 - 生成列：`month` / `year` / `dow` / `hour` / `signed_amount` 全部由日期时间自动推算，写入端不用维护。
 - `amount` 存绝对值，`sign` 为 1 或 -1，聚合一律用 `signed_amount`。
+- **预授权不在 `tx`**：占用额度的那笔进 `hold`（不是支出），真正入账的「预授权完成」进 `tx` 并标 `state='预授权完成'`。
+- **`bill` 是账本级**：来自电子账单表头，`due_amount` 是本期应还（不是消费额）。
+- **`credit` 是额度流水**：来自每日信用管家的可用额度，用来反推真实已用额度；`limit_credit`
+  是该封邮件自带的额度（只有老版式能反推出来），有值时优先于账单额度时间线。
 - 索引：日期、月份、年份、星期、商户、类型、渠道、卡号、mail_id 均单独建索引。
 - 视图：`v_tx`（含中文星期）、`v_monthly`、`v_merchant`、`v_channel`。
-- 全文索引：`tx_fts` 用 FTS5 + **trigram** 分词，中文子串可检索；`unicode61` 会把整句中文当一个 token，"星巴克" 搜不到 "星巴克咖啡（国贸店）"。
+- 全文索引：`tx_fts` 用 FTS5 + **trigram** 分词，中文子串可检索；`unicode61` 会把整句中文当一个 token，"星巴克" 搜不到 "星巴克咖啡（国贸店）"。trigram 对 <3 字符的串不建索引，所以两字商户（美团、滴滴）自动退化为 LIKE。
 
-### 导入的两个处理
+### 导入的四个处理
 
-**商户名跨邮件归一**：银行在短信体里截断商户名，同一家店会裂成 "北京轨道交通路网管理有限" 和 "...有限公司"。导入末尾统一做一次前缀合并（短名 ≥ 8 字、是长名前缀、长度差 ≤ 6），实测能合并上千行。
+**商户名跨邮件归一**：银行在短信体里截断商户名，同一家店会裂成 "某某网络科技有限" 和 "...有限公司"。导入末尾统一做一次前缀合并（短名 ≥ 8 字、是长名前缀、长度差 ≤ 6），实测能合并上千行。
 
 **退款符号**：`parse_email` 只做抽取，`sign = -1` 由 db 层按 `kind == '退款'` 打上。漏了这步，净支出会等于原额。
+
+**负数金额**：每日信用管家把退货写成 `CNY -123.45`，早期版本的金额正则不接受负号，整行被丢掉——
+2022 年之后的上百笔退款因此从未入库，净支出被高估了数万元。现在 `_signed_amount` 保留符号，
+描述里没有「退货/冲正」字样时按退款判定，方向仍由 `sign` 承载。
+
+**老版式额度反推**：2017–2019 的「信用管家消费提醒」把标签做成了图片，单元格里只剩两个 `￥金额`。
+用 500 余组相邻邮件的数字变化与期间消费额比对得出：**前一个是已用额度，后一个是可用额度**，
+两者相加正好是当期信用额度（都是整千元量级，含临时额度）。
+合计不是整千元时视为没对上、直接放弃，宁可缺数也不写错——这样补回了数百封邮件的额度曲线。
+
+**预授权拆两路**：早期邮件把「预授权」和「预授权完成」写成两种描述，直接入库会让同一笔钱算两遍
+（先占用 2000、完成再扣 2000）。所以解析时按状态分流：`预授权`/`撤销` 进 `hold` 表（只占额度、不计支出），
+`预授权完成` 进 `tx` 并标 `state='预授权完成'`。顺带把状态词从商户名里剥掉——原实现会把
+"预授权完成 某某租车" 的商户存成 "完成 某某租车"。
 
 ## 二、Vue3 + ECharts 面板
 
@@ -389,12 +426,18 @@ cd dashboard && npm run build
 ### 面板功能
 
 - KPI 卡带数字滚动；净支出、笔数、笔均、商户数随筛选实时变化。
+- 净支出卡下方一行**环比 / 同比**（涨红跌绿），取最近一个完整月与上月、去年同月比，
+  跟着筛选条件走；下钻到某个月时自动隐藏，避免与所看月份混淆。
+- **账单与额度**：本期应还 / 到期还款日（含剩余天数）/ 可用额度 / 已用额度占比，
+  外加额度使用率折线（按月，虚线是 30% 参考线）和最近 6 期账单的对账差额。
 - 月度趋势：点柱子下钻到该月，再点取消；虚线为月均。
 - 「按月播放」：逐月自动推进，其他图表跟着动，用来看结构随时间怎么变。
 - 类型柱图 / 商户排行 / 渠道排行：点击即筛选。
 - 星期 × 小时热力图：颜色深浅表示该时段净支出。
 - 金额分布：笔数柱 + 合计折线双轴。
 - 明细表：默认 40 条，可续加载，退款显示为绿色正号。
+
+> 账单与额度那块**不随上方筛选变化**——它是账本级口径，跟「这个月花了多少」不是一回事。
 
 ## 启动与解释器探测
 
@@ -443,9 +486,43 @@ CMB_MAIL_DIR=/path/to/eml   # 邮件目录
 CMB_DB=/path/to/cmb.db      # 数据库位置
 ```
 
+## 环比/同比怎么算
+
+`compare` 不写死在 SQL 里循环，先把整库按月（或按年）汇总成一条时间序列，再取两期相减：
+
+- `granularity=month|year` 决定周期粒度，`compare=mom|yoy` 决定比上一期还是去年同期
+  （月维度退 12 个月，年维度退 1 年，不能混）。
+- **当期没走完时自动退到上一个完整周期**。库里最后一笔在 10 号，11 月就是半个月，
+  拿它比 10 月只会得出「腰斩」的假结论；此时返回 `skipped_partial` 并在 `caveat` 里说明。
+- `by=merchant|kind|channel|card` 会把两期的差额按维度拆开、按变动绝对值排序，
+  这是回答「为什么这个月多花了」的关键——只看总差额没有意义。
+- 基期为 0 时 `pct` 返回 `null` 而不是 0 或无穷大。
+
+## 周期扣款怎么认
+
+`subscriptions` 不认品牌名单，只看行为，所以话费、物业费、车险年缴都能自己浮出来：
+
+1. 同一商户（名小写归一，规避银行截断造成的 `Microsoft*Subscription` / `MICROSOFT*SUBSCRIPTION` 分裂）；
+2. 扣款间隔的中位数落在 `24–40`（月）/ `70–110`（季）/ `330–400`（年）天；
+3. 至少 `5 / 3 / 2` 期，且整体跨度有下限——「3 个月扣 4 次」不算订阅，那只是常去；
+4. 周期覆盖率 ≥ 0.7，每期笔数 ≤ 2（一条订阅一个月扣一次，食堂不是）；
+5. 每期金额的 MAD/中位数 ≤ 0.05 标「固定金额」，≤ 0.3 标「小幅浮动」，再高标「波动较大」
+   （通常是话费这种按量计费，不是订阅）。
+
+结论里给 `monthly_cost` 与 `annual_cost`（季付按 ÷3、年付按 ÷12 折算）、`next_expected`
+（末次 + 间隔中位数）和 `active`（超过 1.6 个周期没扣 → 疑似已停）。
+
 ## 已知口径限制
 
-- 金额为「消费提醒」口径的净额（消费减退款），不是账单金额。
-- 还款数据独立来自自动还款通知，与消费不同期，不能相减当欠款。
-- 约 20 笔交易类型字段为空（银行描述未写），面板与 SQL 都归为「未分类」。
+- **消费金额是「消费提醒」口径的净额**（消费减退款），不是账单金额；账本级要调 `bills`。
+- **预授权不计入净支出**：只占额度，存在 `hold` 表；`get_overview` 会单独列出笔数与金额。
+- **还款数据独立**来自自动还款通知，与消费不同期，不能相减当欠款。
+- **账单周期与交易日期错位一天**：账单按记账日、提醒按交易日，所以每期 `reconcile_diff`
+  （账单消费 − 提醒流净支出）通常有几百到几千的差，属正常；差值突然变大才说明提醒流缺邮件。
+- **额度上限含临时额度**：账单里的 `credit_limit` 在临时提额月份会偏高，所以 `credit_usage`
+  对「可用额度 > 固定额度」的点按 0 已用处理并打 `temp_limit` 标记，不输出负值。
+- **利息字段**：只有 2023 年后的账单版式带 `interest`，更早的账单没有该列（历史账单实测利息均为 0）。
+- **旧版账单只有三个数**：2017–2022 的 77 期账单只解析出「到期日 / 应还 / 最低还款」，没有额度和消费明细。
+- **2017–2019 的额度是反推值**：老版式邮件没有文字标签，额度由上「已用 + 可用」相加得出，
+  与账单里的 `credit_limit` 可能因临时额度而不一致；`credit_usage` 优先用邮件自带值。
 - 面板数据是打开时的快照；新增邮件后先增量导入，再重新打开面板。

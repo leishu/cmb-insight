@@ -56,6 +56,57 @@ export function decode(payload) {
   return rows
 }
 
+/**
+ * 环比/同比：取最近一个「完整月」与上月、去年同月比。
+ *
+ * 当月还没走完时（库内最后一笔不在月末）要跳过它，
+ * 否则拿半个月去比整月，环比永远是大跌。
+ */
+export function periodCompare(rows) {
+  const netByMonth = new Map()
+  const lastDay = new Map()
+  for (const r of rows) {
+    if (!r.month) continue
+    netByMonth.set(r.month, (netByMonth.get(r.month) || 0) + r.signed)
+    if (r.date > (lastDay.get(r.month) || '')) lastDay.set(r.month, r.date)
+  }
+  const months = [...netByMonth.keys()].sort()
+  if (months.length < 2) return null
+
+  const complete = (m) => {
+    const [y, mo] = m.split('-').map(Number)
+    const days = new Date(y, mo, 0).getDate()
+    const last = lastDay.get(m)
+    return !!last && Number(last.slice(8, 10)) >= days
+  }
+
+  let idx = months.length - 1
+  let skipped = ''
+  if (!complete(months[idx])) {
+    skipped = months[idx]
+    idx -= 1
+  }
+  if (idx < 1) return null
+
+  const cur = months[idx]
+  const prev = months[idx - 1]
+  const yoyKey = `${Number(cur.slice(0, 4)) - 1}${cur.slice(4)}`
+  const curNet = netByMonth.get(cur)
+  const prevNet = netByMonth.get(prev) || 0
+  const yoyNet = netByMonth.has(yoyKey) ? netByMonth.get(yoyKey) : null
+  const pct = (now, base) => (base ? Math.round(((now - base) / Math.abs(base)) * 1000) / 10 : null)
+
+  return {
+    current: { month: cur, net: curNet },
+    prev: { month: prev, net: prevNet },
+    mom: pct(curNet, prevNet),
+    momDelta: Math.round((curNet - prevNet) * 100) / 100,
+    yoy: yoyNet === null ? null : pct(curNet, yoyNet),
+    yoyMonth: yoyKey,
+    skipped
+  }
+}
+
 export function summarize(rows) {
   let net = 0
   let gross = 0

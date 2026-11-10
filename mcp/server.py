@@ -6,9 +6,12 @@
   get_overview        数据口径与总量
   aggregate           按维度聚合
   top_merchants       商户排行
+  compare             环比/同比
+  subscriptions       周期扣款（订阅）识别
   search_transactions 明细检索（FTS5 全文）
   run_sql             只读 SQL 查询
   render_chart        生成 PNG 柱状图
+  bills               账单列表与对账
   open_dashboard      打开可视化面板（MCP App）
 """
 
@@ -33,6 +36,19 @@ MAIL_DIR = os.environ.get("CMB_MAIL_DIR") or os.path.join(PLUGIN_ROOT, "..", "�
 DASHBOARD_HTML = os.path.join(PLUGIN_ROOT, "dashboard", "dist", "index.html")
 DASHBOARD_URI = "ui://cmb-insight/dashboard"
 
+
+def _plugin_version() -> str:
+    """版本号以 plugin.json 为准：握手信息和清单各写一份迟早会不一致。"""
+    try:
+        with open(os.path.join(PLUGIN_ROOT, ".codebuddy-plugin", "plugin.json"),
+                  encoding="utf-8") as f:
+            return str(json.load(f).get("version") or "0.0.0")
+    except (OSError, ValueError):
+        return "0.0.0"
+
+
+VERSION = _plugin_version()
+
 WEEK_ORDER = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 _STATE: dict = {}
@@ -44,14 +60,20 @@ def log(msg: str) -> None:
 
 
 def conn():
-    """惰性打开数据库；库不存在时先从邮件目录导入一次。"""
+    """惰性打开数据库；库不存在或结构落后时先从邮件目录导入一次。"""
     if "conn" in _STATE:
         return _STATE["conn"]
     if not os.path.exists(DB_PATH):
         log(f"数据库不存在，正在从 {MAIL_DIR} 导入…")
         db.import_dir(os.path.abspath(MAIL_DIR), DB_PATH, quiet=True)
-    _STATE["conn"] = db.connect(DB_PATH)
-    return _STATE["conn"]
+    c = db.connect(DB_PATH)
+    if db.ensure_schema(c):
+        log(f"库结构已升级（schema v{db.SCHEMA_VERSION}），正在全量重建…")
+        c.close()
+        db.import_dir(os.path.abspath(MAIL_DIR), DB_PATH, rebuild=True, quiet=True)
+        c = db.connect(DB_PATH)
+    _STATE["conn"] = c
+    return c
 
 
 def _rows(agg: list[dict]) -> list[dict]:
@@ -89,9 +111,32 @@ def tool_overview() -> dict:
         "merchant_count": ov["merchants"],
         "repayment_count": ov["repay_records"],
         "repayment_total": ov["repay_total"],
+        "hold_count": ov["hold_records"],
+        "hold_amount": ov["hold_amount"],
+        "bill_count": ov["bill_records"],
+        "bill_interest_total": ov["bill_interest"],
+        "data_quality": ov["coverage"],
         "cards": cards,
-        "caveat": "金额为邮件提醒口径的净额（消费-退款）；还款来自自动还款通知，"
-                  "与消费不完全同期，二者不可相减当欠款。",
+        "caveat": "金额为邮件提醒口径的净额（消费-退款）；预授权只是占用额度、不计入净支出，"
+                  "单独存在 hold 表。还款来自自动还款通知，与消费不完全同期，"
+                  "二者不可相减当欠款；账本级口径见 bills 工具。",
+    }
+
+
+def tool_bills(limit: int = 12, since=None) -> dict:
+    c = conn()
+    summary = db.bill_summary(c)
+    rows = db.bills(c, limit=limit, since=since)
+    usage = db.credit_usage(c, 24)
+    if usage.get("latest"):
+        summary["latest_avail_credit"] = usage["latest"]["avail"]
+        summary["latest_used"] = usage["latest"]["used"]
+        summary["latest_used_pct"] = usage["latest"]["pct"]
+    return {
+        "summary": summary,
+        "interest_months": db.interest_months(c),
+        "credit_usage": usage,
+        "bills": rows,
     }
 
 
@@ -106,6 +151,20 @@ def tool_aggregate(dimension: str, since=None, until=None, kind=None,
     net = round(sum(r["amount"] for r in rows), 2)
     return {"dimension": dimension, "total": total, "net_spend": net,
             "items": rows[: max(1, min(limit, 200))]}
+
+
+def tool_compare(granularity="month", current=None, compare="mom", by=None,
+                 since=None, until=None, top=6) -> dict:
+    """环比/同比：本期 vs 上一期或去年同期，并可给出拉高/拉低的类别。"""
+    return db.compare_periods(conn(), granularity, current, compare, by=by,
+                              since=since, until=until, top=top)
+
+
+def tool_subscriptions(since=None, until=None, cadence=None, min_coverage=0.7,
+                       include_inactive=True, limit=50) -> dict:
+    """周期扣款/订阅识别。"""
+    return db.detect_subscriptions(conn(), since, until, cadence, min_coverage,
+                                   include_inactive, limit)
 
 
 def tool_search(keyword=None, since=None, until=None, kind=None,
@@ -188,7 +247,12 @@ SCHEMA_HINT = (
     "mail(id, file, subject, mail_time, mail_date, category, size_bytes, tx_count, "
     "bill_amount, body_text)；"
     "tx(id, mail_id, card, tx_date, tx_time, month, year, dow, hour, kind, channel, "
-    "merchant, amount, sign, signed_amount, layout)；"
+    "merchant, amount, sign, signed_amount, layout, state)；"
+    "hold(id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout) "
+    "是预授权占用额度，不是支出，不进 tx；"
+    "bill(id, mail_id, bill_month, cycle_start, cycle_end, due_date, credit_limit, "
+    "due_amount, min_amount, prev_balance, payment, debits, credits, interest, layout) "
+    "是电子账单表头（账本级口径）；"
     "视图 v_tx / v_monthly / v_merchant / v_channel；"
     "全文索引 tx_fts(merchant, channel, subject)，trigram 分词。"
     "signed_amount = amount * sign，退款 sign=-1。"
@@ -228,6 +292,42 @@ TOOLS = [
                 "since": {"type": "string"},
                 "until": {"type": "string"},
                 "limit": {"type": "integer", "default": 15},
+            },
+        },
+    },
+    {
+        "name": "compare",
+        "description": "环比/同比对比：本期净支出 vs 上一期（mom）或去年同期（yoy），返回差额、变化率，以及按维度拆出的「主要变动项」（哪些商户/类型把差额推上去或拉下来）。回答「这个月比上个月多花多少」「为什么涨了」用这个，不要自己写 SQL。当期未走完时会自动跳到上一个完整周期并说明。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "granularity": {"type": "string", "enum": ["month", "year"], "default": "month"},
+                "current": {"type": "string",
+                            "description": "本期标签，如 2026-10 或 2026；省略则取最近一个完整周期"},
+                "compare": {"type": "string", "enum": ["mom", "yoy"], "default": "mom",
+                            "description": "mom=环比（比上一期），yoy=同比（比去年同期）"},
+                "by": {"type": "string", "enum": ["kind", "channel", "merchant", "card"],
+                       "description": "差额按该维度拆解，建议默认传 merchant"},
+                "top": {"type": "integer", "default": 6, "description": "返回几个变动项"},
+                "since": {"type": "string"},
+                "until": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "subscriptions",
+        "description": "识别周期扣款/订阅：按「同一商户、扣款间隔规律、每期金额接近」自动发现，返回周期（月度/季度/年度）、单期金额、折合月成本与年成本、上次扣款与下次预计、是否疑似已停。用于回答「我有哪些订阅/固定支出」「每月固定开销多少」。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string"},
+                "until": {"type": "string"},
+                "cadence": {"type": "string", "enum": ["monthly", "quarterly", "yearly"]},
+                "min_coverage": {"type": "number", "default": 0.7,
+                                 "description": "周期覆盖率下限，调低（如 0.5）能多找出不规律的固定支出"},
+                "include_inactive": {"type": "boolean", "default": True,
+                                     "description": "是否包含疑似已停止的扣款"},
+                "limit": {"type": "integer", "default": 50},
             },
         },
     },
@@ -276,8 +376,19 @@ TOOLS = [
         },
     },
     {
+        "name": "bills",
+        "description": "账本级视图：电子账单的信用额度、本期应还、最低还款、到期还款日、本期消费/退款、利息，以及每期与提醒流的对账差额。回答「额度多少/这期该还多少/什么时候到期/有没有利息/提醒数据准不准」时用它。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 12, "description": "返回最近多少期"},
+                "since": {"type": "string", "description": "只看该日期之后的账单期 YYYY-MM-DD"},
+            },
+        },
+    },
+    {
         "name": "open_dashboard",
-        "description": "在对话下方打开招行消费可视化面板（Vue3 + ECharts）：月度趋势下钻、类型占比、渠道/商户排行、星期×小时热力图、金额分布、明细表，支持联动筛选与按月播放。用户想看图表或说「打开面板/看板」时调用。",
+        "description": "在对话下方打开招行消费可视化面板（Vue3 + ECharts）：顶部账单与额度（应还/到期日/可用额度/使用率/对账）、月度趋势下钻、类型占比、渠道/商户排行、星期×小时热力图、金额分布、明细表，支持联动筛选与按月播放。用户想看图表或说「打开面板/看板」时调用。",
         "inputSchema": {
             "type": "object",
             "properties": {"focus": {"type": "string",
@@ -323,7 +434,14 @@ def call_tool(name: str, args: dict) -> dict:
                    f"时间跨度 {data['date_range']['from']} ~ {data['date_range']['to']}，"
                    f"净支出 {data['net_spend']:,.2f} 元，退款 {data['refund_count']} 笔共 "
                    f"{data['refund_amount']:,.2f} 元，还款 {data['repayment_count']} 笔共 "
-                   f"{data['repayment_total']:,.2f} 元。")
+                   f"{data['repayment_total']:,.2f} 元；预授权 {data['hold_count']} 笔 "
+                   f"{data['hold_amount']:,.2f} 元（占用额度，不计入净支出，单列）。")
+        q = data["data_quality"]
+        if q["missing_months"]:
+            summary += f"\n注意：{len(q['missing_months'])} 个月没有任何交易（{', '.join(q['missing_months'][:6])}）。"
+        if q["low_months"]:
+            low = "、".join(f"{i['month']}({i['tx']} 笔)" for i in q["low_months"][:6])
+            summary += f"\n低覆盖月（疑似漏邮件）：{low}，月均中位数 {q['median_tx_per_month']} 笔。"
         return {"content": [{"type": "text", "text": summary + "\n\n" + text_of(data)}],
                 "structuredContent": data}
     if name == "aggregate":
@@ -340,6 +458,45 @@ def call_tool(name: str, args: dict) -> dict:
         lines = [f"{n + 1}. {i['label']}\t{i['count']} 笔\t{i['amount']:,.2f} 元"
                  for n, i in enumerate(data["items"])]
         return {"content": [{"type": "text", "text": "商户排行（净金额）\n" + "\n".join(lines)}],
+                "structuredContent": data}
+    if name == "compare":
+        data = tool_compare(args.get("granularity", "month"), args.get("current"),
+                            args.get("compare", "mom"), args.get("by"),
+                            args.get("since"), args.get("until"),
+                            int(args.get("top", 6)))
+        if data.get("error"):
+            return {"content": [{"type": "text", "text": data["error"]}], "isError": True}
+        p, b = data["period"], data["baseline"]
+        sign = "+" if data["delta"] >= 0 else ""
+        pct = "—" if data["pct"] is None else f"{sign}{data['pct']}%"
+        head = (f"{p['label']} 净支出 {p['net']:,.2f} 元（{p['count']} 笔），"
+                f"{data['compare_label']} {b['label']} 的 {b['net']:,.2f} 元，"
+                f"差额 {sign}{data['delta']:,.2f}（{pct}）。")
+        if data.get("skipped_partial"):
+            head += f"（{data['skipped_partial']} 尚未走完，已跳过）"
+        if data["period"].get("missing"):
+            head += "（该期没有任何交易）"
+        lines = [f"{m['label']}\t{m['net']:>10,.2f}\t较基期 {m['delta']:+,.2f}"
+                 + (f"\t{m['pct']:+.1f}%" if m["pct"] is not None else "")
+                 for m in data["movers"]]
+        if lines:
+            head += "\n主要变动："
+        return {"content": [{"type": "text", "text": head + ("\n" + "\n".join(lines) if lines else "")}],
+                "structuredContent": data}
+    if name == "subscriptions":
+        data = tool_subscriptions(args.get("since"), args.get("until"),
+                                  args.get("cadence"), float(args.get("min_coverage", 0.7)),
+                                  bool(args.get("include_inactive", True)),
+                                  int(args.get("limit", 50)))
+        s = data["summary"]
+        head = (f"识别到 {s['found']} 个周期扣款（活跃 {s['active']} 个），"
+                f"合计每月 {s['monthly_total']:,.2f} 元、每年 {s['annual_total']:,.2f} 元。")
+        lines = [f"{i['merchant']}\t{i['cadence_label']}\t单期 {i['amount']:,.2f}\t"
+                 f"月均 {i['monthly_cost']:,.2f}\t上次 {i['last_date']}\t"
+                 f"下次约 {i['next_expected']}\t{i['stability']}"
+                 + ("" if i["active"] else "\t（疑似已停）")
+                 for i in data["items"]]
+        return {"content": [{"type": "text", "text": head + ("\n" + "\n".join(lines) if lines else "")}],
                 "structuredContent": data}
     if name == "search_transactions":
         data = tool_search(args.get("keyword"), args.get("since"), args.get("until"),
@@ -364,6 +521,28 @@ def call_tool(name: str, args: dict) -> dict:
     if name == "render_chart":
         return tool_render_chart(args.get("dimension", "month"), args.get("since"),
                                  args.get("until"), int(args.get("limit", 12)))
+    if name == "bills":
+        data = tool_bills(int(args.get("limit", 12)), args.get("since"))
+        s = data["summary"]
+        latest = s["latest"] or {}
+        head = (f"账本级：{s['bill_count']} 期账单（{s['range'][0]} ~ {s['range'][1]}），"
+                f"信用额度 {s['credit_limit'] or '-'}，累计利息 {s['interest_total']:,.2f} 元；"
+                f"最新一期 {latest.get('bill_month', '-')} 应还 {latest.get('due_amount') or 0:,.2f}，"
+                f"最低 {latest.get('min_amount') or 0:,.2f}，到期 {latest.get('due_date') or '-'}。")
+        if s.get("latest_used_pct") is not None:
+            head += (f"\n当前已用额度 {s['latest_used']:,.2f}（{s['latest_used_pct']}%），"
+                     f"可用 {s['latest_avail_credit']:,.2f}。")
+        lines = []
+        for b in data["bills"]:
+            diff = b.get("reconcile_diff")
+            spend = b["debits"]
+            spend_txt = f"{spend:>10,.2f}" if spend is not None else f"{'—':>10}"
+            lines.append(
+                f"{b['bill_month']}\t应还 {b['due_amount'] or 0:>10,.2f}\t"
+                f"消费 {spend_txt}\t利息 {b['interest'] or 0:>7,.2f}\t到期 {b['due_date'] or '-'}"
+                + (f"\t对账差 {diff:,.2f}" if diff is not None else ""))
+        return {"content": [{"type": "text", "text": head + "\n" + "\n".join(lines)}],
+                "structuredContent": data}
     if name == "open_dashboard":
         data = dashboard_payload()
         return {
@@ -395,7 +574,7 @@ def handle(req: dict) -> dict | None:
             "protocolVersion": client_ver,
             "capabilities": {"tools": {"listChanged": False},
                              "resources": {"listChanged": False, "subscribe": False}},
-            "serverInfo": {"name": "cmb-insight", "version": "0.2.0"},
+            "serverInfo": {"name": "cmb-insight", "version": VERSION},
             "instructions": "招商银行信用卡邮件洞察，数据存放在 SQLite（data/cmb.db）。"
                             "查汇总先调 get_overview 对齐口径；复杂统计用 run_sql；"
                             "要图表调 open_dashboard。金额单位为人民币元。",

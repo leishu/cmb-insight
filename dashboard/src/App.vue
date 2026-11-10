@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   amountHist, byChannel, byKind, byMerchant, byMonth, decode,
-  facetOptions, fmtMoney, fmtShort, heatGrid, loadPayload, summarize, WEEK
+  facetOptions, fmtMoney, fmtShort, heatGrid, loadPayload, periodCompare, summarize, WEEK
 } from './logic/aggregate'
 import TrendChart from './components/TrendChart.vue'
 import KindBars from './components/KindBars.vue'
@@ -10,11 +10,14 @@ import RankBar from './components/RankBar.vue'
 import HeatMap from './components/HeatMap.vue'
 import AmountHist from './components/AmountHist.vue'
 import TxTable from './components/TxTable.vue'
+import BillPanel from './components/BillPanel.vue'
 
 const loading = ref(true)
 const error = ref('')
 const rows = ref([])
 const meta = ref({})
+const bills = ref([])
+const credit = ref([])
 
 const filters = reactive({ year: '', kind: '', card: '', channel: '', keyword: '' })
 const keywordInput = ref('')
@@ -28,6 +31,8 @@ onMounted(async () => {
     const payload = await loadPayload()
     rows.value = decode(payload)
     meta.value = payload.meta || {}
+    bills.value = payload.bills || []
+    credit.value = payload.credit || []
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
@@ -69,6 +74,9 @@ const focused = computed(() =>
 
 const stat = computed(() => summarize(focused.value))
 const months = computed(() => byMonth(scope.value))
+// 环比/同比跟着筛选走：只看某一年时，就是那一年的月度变化
+const cmp = computed(() => periodCompare(scope.value))
+const pctText = (v) => (v === null || v === undefined ? '—' : `${v > 0 ? '+' : ''}${v}%`)
 
 /* ---------------- KPI 数字滚动 ---------------- */
 const anim = reactive({ net: 0, count: 0, avg: 0, merchants: 0 })
@@ -239,6 +247,13 @@ const peakHour = computed(() => {
         <div class="sub">
           原额 <b>¥{{ fmtShort(stat.gross) }}</b> · 退款 <b>{{ stat.refunds }} 笔</b>
         </div>
+        <div class="sub cmp" v-if="cmp && !activeMonth">
+          环比
+          <b :class="cmp.mom === null ? '' : cmp.mom >= 0 ? 'up' : 'down'">{{ pctText(cmp.mom) }}</b>
+          · 同比
+          <b :class="cmp.yoy === null ? '' : cmp.yoy >= 0 ? 'up' : 'down'">{{ pctText(cmp.yoy) }}</b>
+          <span class="hint">{{ cmp.current.month }} vs {{ cmp.prev.month }} / {{ cmp.yoyMonth }}</span>
+        </div>
       </div>
       <div class="kpi k2">
         <div class="label"><span>交易笔数</span><span>均 {{ fmtMoney(stat.perMonth, 0) }}/月</span></div>
@@ -259,6 +274,14 @@ const peakHour = computed(() => {
 
     <!-- 图表 -->
     <section class="grid">
+      <div class="card col-12" v-if="bills.length">
+        <header>
+          <h2>账单与额度<span>账本级 · 来自电子账单与每日信用管家</span></h2>
+          <span class="hint">差额 = 账单消费 − 同期提醒流净支出</span>
+        </header>
+        <BillPanel :bills="bills" :credit="credit" />
+      </div>
+
       <div class="card col-8">
         <header>
           <h2>月度净支出<span>{{ months.length }} 个月</span></h2>
@@ -328,8 +351,8 @@ const peakHour = computed(() => {
     </section>
 
     <footer class="foot">
-      <span>数据口径：消费提醒口径的净额（消费减退款），不含手续费与利息</span>
-      <span>还款数据独立来自「自动还款」通知，与消费不抵扣</span>
+      <span>交易口径：消费提醒口径的净额（消费减退款），预授权只占用额度、不计入</span>
+      <span>账本级：额度/应还/到期日/利息来自电子账单，按账单周期与提醒流对账</span>
       <span>来源：{{ meta.mails || 0 }} 封邮件解析</span>
       <span>Vue 3 + ECharts · 数据由 SQLite 实时生成</span>
     </footer>

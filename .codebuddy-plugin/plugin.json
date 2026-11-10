@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "cmb-insight",
-  "version": "0.2.0",
-  "description": "招商银行信用卡邮件洞察：把导出的 .eml 解析进 SQLite，提供汇总/检索/只读 SQL 工具，以及一个 Vue3 + ECharts 的可交互消费面板（MCP App）。",
+  "version": "0.3.0",
+  "description": "招商银行信用卡邮件洞察：把导出的 .eml 解析进 SQLite，提供汇总/检索/环比同比/订阅识别/只读 SQL 工具，以及一个 Vue3 + ECharts 的可交互消费面板（MCP App）。",
   "author": {
     "name": "leishu"
   },
