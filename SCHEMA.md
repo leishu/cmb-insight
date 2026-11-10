@@ -1,10 +1,10 @@
-# 数据库结构说明（schema v4）
+# 数据库结构说明（schema v5）
 
 `data/cmb.db` —— SQLite，零外部依赖。所有数据都从 `.eml` 解析而来，**没有不可再生的人工录入**，
 所以库结构升级时直接全量重建，不会丢东西。
 
-- 建表 SQL：`mcp/db.py` 里的 `SCHEMA` 常量（第 45 行起）
-- 结构版本：`SCHEMA_VERSION = 4`（`db.py:43`），存在 `meta` 表里，**不是** `PRAGMA user_version`
+- 建表 SQL：`mcp/db.py` 里的 `SCHEMA` 常量（第 47 行起）
+- 结构版本：`SCHEMA_VERSION = 5`（`db.py:45`），存在 `meta` 表里，**不是** `PRAGMA user_version`
 - 写入者：`mcp/db.py`（导入层）、`mcp/cmb_parse.py`（抽取层，只产出 dict，不碰库）
 - 读取者：`mcp/server.py` 的 10 个 MCP 工具、`dashboard/` 面板
 
@@ -24,13 +24,13 @@
         ┌───────────────────────────────────────────┐
         │                  mail                      │  一封 .eml 一行（原文层）
         │  id / file / subject / mail_time / ...     │
-        └────┬───────────┬───────────┬───────────┬──┘
-             │1:N        │1:N        │1:1        │1:1
-             ▼           ▼           ▼           ▼
-        ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
-        │   tx   │  │  hold  │  │  bill  │  │ credit │
-        │ 交易明细│  │预授权占用│  │账单账本 │  │额度流水 │
-        └───┬────┘  └────────┘  └────────┘  └────────┘
+        └────┬───────────┬───────────┬───────────┬───────────┬──┘
+             │1:N        │1:N        │1:N        │1:1        │1:1
+             ▼           ▼           ▼           ▼           ▼
+        ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
+        │   tx   │  │ tx_fx  │  │  hold  │  │  bill  │  │ credit │
+        │CNY交易 │  │外币交易 │  │预授权占用│  │账单账本 │  │额度流水 │
+        └───┬────┘  └────────┘  └────────┘  └────────┘  └────────┘
             │ 1:1（rowid = tx.id）
             ▼
         ┌────────┐
@@ -38,8 +38,8 @@
         └────────┘
 ```
 
-四张子表都挂了 `mail_id` 外键并 `ON DELETE CASCADE`。删一封邮件，它的交易、预授权、账单、
-额度记录一起没。
+五张子表都挂了 `mail_id` 外键并 `ON DELETE CASCADE`。删一封邮件，它的交易（含外币）、预授权、
+账单、额度记录一起没。
 
 ---
 
@@ -55,10 +55,12 @@
 | 我这一期该还多少、最低还多少 | `bill` | 账本级，`due_amount` 是应还**不是**消费额 |
 | 额度用掉几成、涨没涨 | `credit` | `avail_credit` 是每日流水，取时间序列 |
 | 这笔酒店押金算支出了吗 | `hold` | **不算**，预授权只占额度 |
+| 港币/美元等外币消费 | `tx_fx` | 原币入库，**不在人民币总额里**，按 `currency` 分组单报 |
 | 邮件本身（原始正文、主题、大小） | `mail` | `body_text` 存了正文纯文本 |
 | 库里现在多少行、什么时候同步的 | `meta` | `mail_count` / `last_sync` |
 
-一句话：**`tx` 是消费分析的主力，`bill` 是账本对账，`credit` 是额度曲线，`hold` 是坑，`mail` 是溯源。**
+一句话：**`tx` 是消费分析的主力（仅人民币），`tx_fx` 是外币单列，`bill` 是账本对账，`credit` 是
+额度曲线，`hold` 是坑，`mail` 是溯源。**
 
 ---
 
@@ -75,7 +77,7 @@
 | `mail_date` | TEXT **生成列** | `substr(mail_time,1,10)` | 只读，别写 |
 | `category` | TEXT | 邮件类型，见下方枚举 | 由主题关键词判定，5 类 |
 | `size_bytes` | INTEGER | 文件字节数 | 增量导入时用来判断「内容变了」→ 删旧重插 |
-| `tx_count` | INTEGER | 这封邮件解析出的**`tx` 行数** | **不含 `hold`**；账单/还款类是 0，正常 |
+| `tx_count` | INTEGER | 这封邮件解析出的交易行数（**`tx` + `tx_fx`**） | **不含 `hold`**；账单/还款类是 0，正常 |
 | `bill_amount` | REAL | 自动还款通知里的**实扣金额** | 只有「自动还款」这类邮件有值；账单类**不写这列**（走 `bill` 表） |
 | `body_text` | TEXT | 正文纯文本（上限 20,000 字符） | HTML 去标签；供全文检索与人工核对 |
 | `imported_at` | TEXT | 入库时间 | 默认 `datetime('now','localtime')` |
@@ -96,9 +98,9 @@
 
 ---
 
-## 3. `tx` —— 交易明细（分析主力表）
+## 3. `tx` —— 交易明细（分析主力表，**仅人民币**）
 
-一行 = 一笔交易。所有消费统计都应该从这里出。
+一行 = 一笔人民币交易。所有 CNY 消费统计都应该从这里出；外币（HKD/USD 等）在 `tx_fx`，见 3.1。
 
 | 列 | 类型 | 含义 | 现状 / 注意 |
 |---|---|---|---|
@@ -134,6 +136,29 @@
 **不要直接写这张表**：`month` / `year` / `dow` / `hour` / `signed_amount` 是 STORED 生成列，
 手写会报错。要改数据就改 `.eml` 然后重建。
 
+### 3.1 `tx_fx` —— 外币交易（原币入库，**不进人民币总额**）
+
+一行 = 一笔非人民币交易（实测目前只有 HKD，量级为个位数百分比都不到）。邮件里**没有人民币折算
+金额**，所以不做折算、也不能与 `tx` 的金额相加；`get_overview` 的 `foreign_currency` 按币种单报。
+
+结构与 `tx` 基本一致，差异如下：
+
+| 列 | 与 `tx` 的差异 |
+|---|---|
+| `currency` | TEXT NOT NULL，ISO 币种码（`HKD` / `USD` …）。`tx` 没有这列（隐含 CNY） |
+| `amount` / `signed_amount` | 单位是**原币**元，不是人民币 |
+| `month` | 生成列，同 `tx` |
+| `year` / `dow` / `hour` | **没有**这三列——行数太少，不值得为它维护生成列 |
+
+其余列（`mail_id` / `card` / `tx_date` / `tx_time` / `kind` / `channel` / `merchant` / `sign` /
+`layout` / `state`）语义与 `tx` 相同。索引：`tx_date` / `mail_id` / `currency`。
+
+- **不进 FTS**：`tx_fts` 只索引 `tx`；`search_transactions` 对 `tx_fx` 用 LIKE 兜底（行数少，够快），
+  返回的每条记录带 `currency` 字段，外币金额单独汇总在 `foreign_net`。
+- 商户名前缀合并（`normalize_merchants`）同时覆盖两张表。
+- 聚合工具（`aggregate` / `top_merchants` / 面板）**只统计 `tx`**，外币要看 `get_overview` 或
+  `search_transactions`，或自己写 SQL 查 `tx_fx`。
+
 ---
 
 ## 4. `hold` —— 预授权占用额度（**不是支出**）
@@ -153,6 +178,7 @@
 | `amount` | REAL | 冻结金额（正数） | |
 | `state` | TEXT | `预授权` / `撤销` | 实测全是 `预授权`，`撤销` 从未出现 |
 | `layout` | TEXT | 来源版式 `A` / `B` | |
+| `currency` | TEXT | 币种码，默认 `CNY` | v5 新增；外币预授权同样原币记录 |
 
 **判定规则**：解析时按描述里的状态词分流——`预授权`/`撤销` → `hold`；`预授权完成` → `tx` 且
 `state='预授权完成'`。两表**不会重复计入**（实测 `hold` 与 `tx` 无任何「同日期+同商户+同金额」重叠）。
@@ -231,6 +257,7 @@
 | `last_sync` | 上次导入完成时间 | `YYYY-MM-DD HH:MM:SS` |
 | `mail_count` | 上次导入的邮件数 | 整数 |
 | `tx_count` | 上次导入的交易数 | 整数 |
+| `tx_fx_count` | 外币交易行数 | 整数 |
 | `hold_count` | 预授权行数 | 整数 |
 | `bill_count` | 账单期数 | 整数 |
 | `credit_count` | 额度快照数 | 整数 |
@@ -243,7 +270,8 @@
 
 ## 8. `tx_fts` —— 全文索引
 
-FTS5 虚拟表，`tokenize='trigram'`。**不是独立数据**，只是 `tx` 的检索副本。
+FTS5 虚拟表，`tokenize='trigram'`。**不是独立数据**，只是 `tx` 的检索副本（**不含 `tx_fx`**，
+外币行走 LIKE）。
 
 | 列 | 来源 |
 |---|---|
@@ -286,6 +314,7 @@ FTS5 虚拟表，`tokenize='trigram'`。**不是独立数据**，只是 `tx` 的
 | 表 | 索引列 | 用途 |
 |---|---|---|
 | `tx` | `tx_date`, `month`, `year`, `dow`, `merchant`, `kind`, `channel`, `card`, `mail_id` | 时间/维度筛选全覆盖 |
+| `tx_fx` | `tx_date`, `mail_id`, `currency` | 外币按日期/币种查 |
 | `mail` | `mail_date`, `category` | 按日期区间、按类型筛邮件 |
 | `bill` | `bill_month` | 取某期账单 |
 | `credit` | `dt` | 额度曲线按时间取 |
@@ -305,10 +334,12 @@ FTS5 虚拟表，`tokenize='trigram'`。**不是独立数据**，只是 `tx` 的
 4. **`bill` 的 12 个字段只有新版式是全的**，老账单只有应还/最低/到期日。
    写查询时对 `cycle_start` / `credits` / `interest` 这些列要么加 `IS NOT NULL`，要么按 `layout` 分支。
 5. **`interest` 全 0 不等于「从来没付过利息」**，而是「新版式那几期确实为 0，老版式压根没这个字段」。
-6. **`tx_count` 不含 `hold`**。所以一封只有预授权的邮件 `tx_count=0`，但它并非空邮件。
+6. **`tx_count` 不含 `hold`，但含 `tx_fx`**。所以一封只有预授权的邮件 `tx_count=0`，但它并非空邮件。
 7. **`merchant` 可能被截断**。银行短信体限长，`某某财产保险股份有限公司北京分公` 少个「司」，
    同一家可能裂成两行。跨商户聚合前先看 `v_merchant` 里有没有长得很像的两条。
 8. **`mail.category='营销/其他'` 不是「解析失败」**。真正的解析失败是 `category='解析失败'`，实测 0 条。
+9. **外币不能加进人民币总额**。`tx_fx.amount` 是原币（如 HKD），邮件里没有折算金额；
+   `SUM(tx.signed_amount) + SUM(tx_fx.signed_amount)` 是无意义的数字。外币按 `currency` 分组单报。
 
 ---
 
@@ -373,4 +404,4 @@ python3 mcp/db.py --stats data/cmb.db
 
 ---
 
-*最后更新：2026-11-10 · schema v4*
+*最后更新：2026-11-10 · schema v5（新增 `tx_fx` 外币表；B 版式日期改取邮件内消费日期）*

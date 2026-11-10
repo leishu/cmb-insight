@@ -40,7 +40,9 @@ PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(PLUGIN_ROOT, "data", "cmb.db")
 
 # 库结构版本：变更表结构时 +1，导入时会自动全量重建（数据全部可由 .eml 复现）
-SCHEMA_VERSION = 4
+# v5: 交易日期改取正文「YYYY/MM/DD 消费」措辞（修复 2020–2021 发送日错位）；
+#     外币交易原币入库到 tx_fx，不再静默丢弃
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -82,6 +84,30 @@ CREATE TABLE IF NOT EXISTS tx (
     state         TEXT NOT NULL DEFAULT ''         -- 空 / 预授权完成
 );
 
+-- 外币交易：原币单列，不混进人民币口径（tx / 各聚合视图只含 CNY）。
+-- 邮件里没有人民币折算金额，不能直接折算；汇总时按 currency 分组单报。
+CREATE TABLE IF NOT EXISTS tx_fx (
+    id            INTEGER PRIMARY KEY,
+    mail_id       INTEGER NOT NULL REFERENCES mail(id) ON DELETE CASCADE,
+    card          TEXT NOT NULL DEFAULT '',
+    tx_date       TEXT NOT NULL,
+    tx_time       TEXT NOT NULL DEFAULT '',
+    month         TEXT GENERATED ALWAYS AS (substr(tx_date, 1, 7)) STORED,
+    kind          TEXT NOT NULL DEFAULT '',
+    channel       TEXT NOT NULL DEFAULT '',
+    merchant      TEXT NOT NULL DEFAULT '',
+    currency      TEXT NOT NULL,                   -- ISO 币种码，如 HKD / USD
+    amount        REAL NOT NULL,                   -- 原币绝对值
+    sign          INTEGER NOT NULL DEFAULT 1,
+    signed_amount REAL GENERATED ALWAYS AS (round(amount * sign, 2)) STORED,
+    layout        TEXT NOT NULL DEFAULT '',
+    state         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_tx_fx_date ON tx_fx(tx_date);
+CREATE INDEX IF NOT EXISTS idx_tx_fx_mail ON tx_fx(mail_id);
+CREATE INDEX IF NOT EXISTS idx_tx_fx_ccy  ON tx_fx(currency);
+
 -- 预授权占用额度，不是支出：单独存，避免虚增净支出
 CREATE TABLE IF NOT EXISTS hold (
     id       INTEGER PRIMARY KEY,
@@ -93,7 +119,8 @@ CREATE TABLE IF NOT EXISTS hold (
     channel  TEXT NOT NULL DEFAULT '',
     amount   REAL NOT NULL,
     state    TEXT NOT NULL DEFAULT '预授权',       -- 预授权 / 撤销
-    layout   TEXT NOT NULL DEFAULT ''
+    layout   TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL DEFAULT 'CNY'
 );
 
 -- 电子账单表头（账本级口径）
@@ -364,34 +391,45 @@ def _insert_mail(conn: sqlite3.Connection, rec: dict, path: str) -> int:
          rec["size"], rec["tx_count"], rec["repay_amount"], body),
     )
     mail_id = cur.lastrowid
-    rows, fts = [], []
+    rows, fx_rows, fts = [], [], []
     for t in rec["txs"]:
         # parse_email 只做抽取，退款打负号这一步在 db 层完成
         sign = t.get("sign") or (-1 if t["kind"] == "退款" else 1)
-        rows.append((mail_id, t["card"], t["date"], t["time"], t["kind"],
-                     t["channel"], t["merchant"], t["amount"], sign,
-                     t.get("layout", ""), t.get("state", "")))
+        row = (mail_id, t["card"], t["date"], t["time"], t["kind"],
+               t["channel"], t["merchant"], t["amount"], sign,
+               t.get("layout", ""), t.get("state", ""))
+        ccy = t.get("currency") or "CNY"
+        if ccy == "CNY":
+            rows.append(row)
+            fts.append((t["merchant"], t["channel"], rec["subject"]))
+        else:
+            fx_rows.append(row + (ccy,))
     conn.executemany(
         """INSERT INTO tx (mail_id, card, tx_date, tx_time, kind, channel,
                            merchant, amount, sign, layout, state)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
+    if fx_rows:
+        conn.executemany(
+            """INSERT INTO tx_fx (mail_id, card, tx_date, tx_time, kind, channel,
+                                  merchant, amount, sign, layout, state, currency)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            fx_rows,
+        )
     holds = rec.get("holds") or []
     if holds:
         conn.executemany(
             """INSERT INTO hold (mail_id, card, tx_date, tx_time, merchant,
-                                 channel, amount, state, layout)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                 channel, amount, state, layout, currency)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [(mail_id, h["card"], h["date"], h["time"], h["merchant"],
               h["channel"], h["amount"], h.get("state") or "预授权",
-              h.get("layout", "")) for h in holds],
+              h.get("layout", ""), h.get("currency") or "CNY") for h in holds],
         )
     _insert_bill(conn, mail_id, rec.get("bill"))
     _insert_credit(conn, mail_id, rec)
-    for t in rec["txs"]:
-        fts.append((t["merchant"], t["channel"], rec["subject"]))
-    # 用最近插入的 tx 行 id 与 fts 行对齐
+    # 用最近插入的 tx 行 id 与 fts 行对齐（fts 只含 CNY 交易，与 rows 一一对应）
     ids = [r[0] for r in conn.execute(
         "SELECT id FROM tx WHERE mail_id = ? ORDER BY id", (mail_id,))]
     conn.executemany(
@@ -407,7 +445,8 @@ def normalize_merchants(conn: sqlite3.Connection) -> int:
     返回被改写的交易行数。规则：短名 >= 8 字且是长名前缀，长度差 <= 6。
     """
     names = [r[0] for r in conn.execute(
-        "SELECT DISTINCT merchant FROM tx WHERE merchant <> ''")]
+        "SELECT DISTINCT merchant FROM tx WHERE merchant <> '' "
+        "UNION SELECT DISTINCT merchant FROM tx_fx WHERE merchant <> ''")]
     if not names:
         return 0
     alias: dict[str, str] = {}
@@ -429,6 +468,8 @@ def normalize_merchants(conn: sqlite3.Connection) -> int:
             seen.add(final)
             final = alias[final]
         cur = conn.execute("UPDATE tx SET merchant = ? WHERE merchant = ?", (final, short))
+        changed += cur.rowcount
+        cur = conn.execute("UPDATE tx_fx SET merchant = ? WHERE merchant = ?", (final, short))
         changed += cur.rowcount
     return changed
 
@@ -460,6 +501,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
         conn.executescript("DROP VIEW IF EXISTS v_tx; DROP VIEW IF EXISTS v_monthly;"
                            " DROP VIEW IF EXISTS v_merchant; DROP VIEW IF EXISTS v_channel;"
                            " DROP TABLE IF EXISTS tx_fts; DROP TABLE IF EXISTS tx;"
+                           " DROP TABLE IF EXISTS tx_fx;"
                            " DROP TABLE IF EXISTS hold; DROP TABLE IF EXISTS bill;"
                            " DROP TABLE IF EXISTS credit;"
                            " DROP TABLE IF EXISTS mail; DROP TABLE IF EXISTS meta;")
@@ -508,6 +550,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
     conn.commit()
 
     total_tx = conn.execute("SELECT COUNT(*) FROM tx").fetchone()[0]
+    total_fx = conn.execute("SELECT COUNT(*) FROM tx_fx").fetchone()[0]
     total_mail = conn.execute("SELECT COUNT(*) FROM mail").fetchone()[0]
     total_hold = conn.execute("SELECT COUNT(*) FROM hold").fetchone()[0]
     total_bill = conn.execute("SELECT COUNT(*) FROM bill").fetchone()[0]
@@ -519,6 +562,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
          ("last_sync", started.strftime("%Y-%m-%d %H:%M:%S")),
          ("mail_count", str(total_mail)),
          ("tx_count", str(total_tx)),
+         ("tx_fx_count", str(total_fx)),
          ("hold_count", str(total_hold)),
          ("bill_count", str(total_bill)),
          ("credit_count", str(total_credit)),
@@ -531,6 +575,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
         "db_bytes": os.path.getsize(db_path) if os.path.exists(db_path) else 0,
         "mail_total": total_mail,
         "tx_total": total_tx,
+        "tx_fx_total": total_fx,
         "hold_total": total_hold,
         "bill_total": total_bill,
         "credit_total": total_credit,
@@ -544,7 +589,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
     conn.close()
     if not quiet:
         print(f"数据库：{info['db']}（{info['db_bytes'] / 1024 / 1024:.1f} MB）")
-        print(f"邮件 {total_mail} 封 · 交易 {total_tx} 笔 · 预授权 {total_hold} 笔 · 账单 {total_bill} 期")
+        print(f"邮件 {total_mail} 封 · 交易 {total_tx} 笔 · 外币 {total_fx} 笔 · 预授权 {total_hold} 笔 · 账单 {total_bill} 期")
         print(f"新增 {added} · 更新 {updated} · 跳过 {skipped} · 失败 {failed} "
               f"· 商户名合并 {changed} 行 · 耗时 {info['elapsed']}s")
     return info
@@ -598,6 +643,10 @@ def overview(conn: sqlite3.Connection) -> dict:
     bill = conn.execute(
         "SELECT COUNT(*) n, ROUND(COALESCE(SUM(interest), 0), 2) interest "
         "FROM bill").fetchone()
+    fx = [{"currency": r["currency"], "count": r["n"], "net_amount": r["net"]}
+          for r in conn.execute(
+              "SELECT currency, COUNT(*) n, ROUND(SUM(signed_amount), 2) net "
+              "FROM tx_fx GROUP BY currency ORDER BY currency")]
     return {
         "mails": mails["n"],
         "mail_range": [mails["first_dt"], mails["last_dt"]],
@@ -614,6 +663,8 @@ def overview(conn: sqlite3.Connection) -> dict:
         "hold_amount": hold["v"],
         "bill_records": bill["n"],
         "bill_interest": bill["interest"],
+        # 外币原币单列：邮件没有人民币折算，不能混进 net_spend
+        "foreign_currency": fx,
         "coverage": coverage(conn),
     }
 
@@ -1188,6 +1239,16 @@ def search_transactions(conn: sqlite3.Connection, keyword: str | None = None,
     base_where, base_params = _filters(since, until, kind)
     kw = (keyword or "").strip()
 
+    def extra_filters():
+        where, params = "", []
+        if min_amount is not None:
+            where += " AND t.amount >= ?"
+            params.append(min_amount)
+        if max_amount is not None:
+            where += " AND t.amount <= ?"
+            params.append(max_amount)
+        return where, params
+
     def run(use_fts: bool) -> list[dict]:
         where, params = base_where, list(base_params)
         if kw:
@@ -1197,16 +1258,30 @@ def search_transactions(conn: sqlite3.Connection, keyword: str | None = None,
             else:
                 where += " AND (t.merchant LIKE ? OR t.channel LIKE ?)"
                 params.extend([f"%{kw}%"] * 2)
-        if min_amount is not None:
-            where += " AND t.amount >= ?"
-            params.append(min_amount)
-        if max_amount is not None:
-            where += " AND t.amount <= ?"
-            params.append(max_amount)
+        ew, ep = extra_filters()
+        where += ew
+        params.extend(ep)
         return [dict(r) for r in conn.execute(f"""
             SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind, t.state,
-                   t.amount, t.sign, t.card, m.category AS mail_category
+                   t.amount, t.sign, t.card, 'CNY' AS currency, m.category AS mail_category
             FROM tx t JOIN mail m ON m.id = t.mail_id
+            WHERE {where}
+            ORDER BY t.tx_date DESC, t.tx_time DESC
+            LIMIT ?""", [*params, limit])]
+
+    def run_fx() -> list[dict]:
+        # 外币行少（几十笔），不进 FTS，直接 LIKE；金额过滤按原币数值
+        where, params = base_where, list(base_params)
+        if kw:
+            where += " AND (t.merchant LIKE ? OR t.channel LIKE ?)"
+            params.extend([f"%{kw}%"] * 2)
+        ew, ep = extra_filters()
+        where += ew
+        params.extend(ep)
+        return [dict(r) for r in conn.execute(f"""
+            SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind, t.state,
+                   t.amount, t.sign, t.card, t.currency, m.category AS mail_category
+            FROM tx_fx t JOIN mail m ON m.id = t.mail_id
             WHERE {where}
             ORDER BY t.tx_date DESC, t.tx_time DESC
             LIMIT ?""", [*params, limit])]
@@ -1214,9 +1289,12 @@ def search_transactions(conn: sqlite3.Connection, keyword: str | None = None,
     # trigram 分词对 <3 字符的串不建索引，直接走 LIKE；
     # >=3 字符优先走 FTS，命中为空时再退一次 LIKE（索引漂移、全角差异都可能漏）
     if kw and len(kw) >= 3:
-        rows = run(True)
-        return rows or run(False)
-    return run(False)
+        rows = run(True) or run(False)
+    else:
+        rows = run(False)
+    merged = rows + run_fx()
+    merged.sort(key=lambda r: (r["tx_date"], r["tx_time"]), reverse=True)
+    return merged[:limit]
 
 
 def monthly(conn: sqlite3.Connection) -> list[dict]:
@@ -1259,7 +1337,13 @@ def dashboard_payload(conn: sqlite3.Connection) -> dict:
 
 
 def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
-    """执行只读查询（仅 SELECT / WITH），返回列名与行。"""
+    """执行只读查询（仅 SELECT / WITH），返回列名与行。
+
+    只读由 SQLite authorizer 在引擎层强制：只放行 SELECT / READ / FUNCTION /
+    RECURSIVE 动作，INSERT/UPDATE/DELETE/DDL/ATTACH/PRAGMA 一律拒绝。
+    不做关键字黑名单——`INSERT\\nINTO` 这类换行变体能绕过文本匹配，
+    而 `SELECT 'update t'` 这种合法字符串又会被误杀。
+    """
     cleaned = re.sub(r"--[^\n]*", " ", sql)
     cleaned = re.sub(r"/\*.*?\*/", " ", cleaned, flags=re.S).strip().rstrip(";").strip()
     if not cleaned:
@@ -1269,14 +1353,26 @@ def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
         raise ValueError("只允许只读查询（SELECT / WITH）")
     if ";" in cleaned:
         raise ValueError("一次只能执行一条语句")
-    lowered = cleaned.lower()
-    for bad in ("insert ", "update ", "delete ", "drop ", "alter ", "attach ", "pragma "):
-        if re.search(rf"\b{bad}", lowered):
-            raise ValueError("只允许只读查询，检测到写操作关键字")
 
-    cur = conn.execute(sql)
-    cols = [d[0] for d in cur.description] if cur.description else []
-    rows = cur.fetchmany(limit)
+    allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+               getattr(sqlite3, "SQLITE_RECURSIVE", 33)}  # WITH RECURSIVE
+
+    def _guard(action, *_args):
+        return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+
+    conn.set_authorizer(_guard)
+    try:
+        cur = conn.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchmany(limit)
+    except sqlite3.DatabaseError as exc:
+        if "not authorized" in str(exc).lower():
+            raise ValueError("只允许只读查询，语句包含写操作或受限动作") from exc
+        raise
+    finally:
+        # 部分 CPython 版本（如 3.10）set_authorizer(None) 不会真正清除回调，
+        # 还原成「全部放行」等效于无 authorizer，且各版本行为一致
+        conn.set_authorizer(lambda *_a: sqlite3.SQLITE_OK)
     return {"columns": cols, "rows": [[_jsonable(v) for v in r] for r in rows],
             "row_count": len(rows), "truncated": len(rows) == limit}
 

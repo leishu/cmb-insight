@@ -115,10 +115,14 @@ def tool_overview() -> dict:
         "hold_amount": ov["hold_amount"],
         "bill_count": ov["bill_records"],
         "bill_interest_total": ov["bill_interest"],
+        "foreign_currency": ov["foreign_currency"],
         "data_quality": ov["coverage"],
         "cards": cards,
-        "caveat": "金额为邮件提醒口径的净额（消费-退款）；预授权只是占用额度、不计入净支出，"
-                  "单独存在 hold 表。还款来自自动还款通知，与消费不完全同期，"
+        "caveat": "金额为邮件提醒口径的净额（消费-退款），仅含人民币交易；"
+                  "外币交易按原币存在 tx_fx 表、在 foreign_currency 单列，"
+                  "邮件没有人民币折算金额，不能与 net_spend 相加。"
+                  "预授权只是占用额度、不计入净支出，单独存在 hold 表。"
+                  "还款来自自动还款通知，与消费不完全同期，"
                   "二者不可相减当欠款；账本级口径见 bills 工具。",
     }
 
@@ -174,9 +178,17 @@ def tool_search(keyword=None, since=None, until=None, kind=None,
     items = [{"date": r["tx_date"], "time": r["tx_time"], "amount": r["amount"],
               "sign": r["sign"], "kind": r["kind"], "channel": r["channel"],
               "merchant": r["merchant"], "card": r["card"],
+              "currency": r.get("currency") or "CNY",
               "mail_category": r["mail_category"]} for r in rows]
+    # 不同币种不能相加：net_spend 只算 CNY，外币按币种单列
+    fx: dict[str, float] = {}
+    for i in items:
+        if i["currency"] != "CNY":
+            fx[i["currency"]] = round(fx.get(i["currency"], 0.0) + i["amount"] * i["sign"], 2)
     return {"matched": len(items),
-            "net_spend": round(sum(i["amount"] * i["sign"] for i in items), 2),
+            "net_spend": round(sum(i["amount"] * i["sign"] for i in items
+                                   if i["currency"] == "CNY"), 2),
+            "foreign_net": fx,
             "items": items}
 
 
@@ -247,7 +259,10 @@ SCHEMA_HINT = (
     "mail(id, file, subject, mail_time, mail_date, category, size_bytes, tx_count, "
     "bill_amount, body_text)；"
     "tx(id, mail_id, card, tx_date, tx_time, month, year, dow, hour, kind, channel, "
-    "merchant, amount, sign, signed_amount, layout, state)；"
+    "merchant, amount, sign, signed_amount, layout, state) 只含人民币交易；"
+    "tx_fx(id, mail_id, card, tx_date, tx_time, month, kind, channel, merchant, "
+    "currency, amount, sign, signed_amount, layout, state) 是外币交易（原币金额，"
+    "currency 如 HKD/USD），不能与 tx 的金额相加；"
     "hold(id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout) "
     "是预授权占用额度，不是支出，不进 tx；"
     "bill(id, mail_id, bill_month, cycle_start, cycle_end, due_date, credit_limit, "
@@ -436,6 +451,10 @@ def call_tool(name: str, args: dict) -> dict:
                    f"{data['refund_amount']:,.2f} 元，还款 {data['repayment_count']} 笔共 "
                    f"{data['repayment_total']:,.2f} 元；预授权 {data['hold_count']} 笔 "
                    f"{data['hold_amount']:,.2f} 元（占用额度，不计入净支出，单列）。")
+        if data.get("foreign_currency"):
+            fx_txt = "、".join(f"{i['currency']} {i['net_amount']:,.2f}（{i['count']} 笔）"
+                              for i in data["foreign_currency"])
+            summary += f"\n外币交易（原币单列，不计入净支出）：{fx_txt}。"
         q = data["data_quality"]
         if q["missing_months"]:
             summary += f"\n注意：{len(q['missing_months'])} 个月没有任何交易（{', '.join(q['missing_months'][:6])}）。"
@@ -502,9 +521,12 @@ def call_tool(name: str, args: dict) -> dict:
         data = tool_search(args.get("keyword"), args.get("since"), args.get("until"),
                            args.get("kind"), args.get("min_amount"),
                            args.get("max_amount"), int(args.get("limit", 30)))
-        lines = [f"{i['date']} {i['time']}\t{i['amount']:>9,.2f}\t{i['merchant']}"
-                 for i in data["items"]]
-        head = f"命中 {data['matched']} 笔，合计 {data['net_spend']:,.2f} 元"
+        lines = [f"{i['date']} {i['time']}\t{i['amount']:>9,.2f}"
+                 + (f" {i['currency']}" if i["currency"] != "CNY" else "")
+                 + f"\t{i['merchant']}" for i in data["items"]]
+        head = f"命中 {data['matched']} 笔，人民币合计 {data['net_spend']:,.2f} 元"
+        if data.get("foreign_net"):
+            head += "；外币 " + "、".join(f"{v:,.2f} {k}" for k, v in data["foreign_net"].items())
         return {"content": [{"type": "text", "text": head + "\n" + "\n".join(lines)}],
                 "structuredContent": data}
     if name == "run_sql":

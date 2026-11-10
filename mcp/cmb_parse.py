@@ -19,13 +19,21 @@ import re
 from datetime import datetime
 from email import policy
 
-AMOUNT_RE = re.compile(r"^(?:CNY|RMB|人民币|￥|¥)?\s*(-?)\s*([0-9][0-9,]*\.?\d{0,2})$")
+# 币种前缀捕获为 group(1)：CNY/RMB/￥/¥ 归一成 CNY，HKD/USD 等原样保留
+AMOUNT_RE = re.compile(r"^([A-Z]{3}|人民币|￥|¥)?\s*(-?)\s*([0-9][0-9,]*\.?\d{0,2})$")
+CURRENCY_ALIASES = {"CNY": "CNY", "RMB": "CNY", "人民币": "CNY", "￥": "CNY", "¥": "CNY", "": "CNY"}
+# 版式 A 的「币别」列是中文；未知币别原样保留（宁可单列，不混进人民币）
+CCY_CN = {"人民币": "CNY", "港币": "HKD", "美元": "USD", "日元": "JPY",
+          "欧元": "EUR", "英镑": "GBP", "澳元": "AUD", "加元": "CAD", "新加坡元": "SGD"}
 # 2017-2019 图片式模板里的金额格：只有「￥12,345.67」，没有文字标签；早年无小数
 OLD_MONEY_RE = re.compile(r"^￥\s*([0-9][0-9,]*(?:\.\d{1,2})?)$")
 TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 DATE8_RE = re.compile(r"^20\d{6}$")
 CARD_TAIL_RE = re.compile(r"尾号\s*(\d{4})")
 BILL_DATE_RE = re.compile(r"(20\d{2})[/-](\d{2})[/-](\d{2})\s*您的消费明细")
+# 2020–2021 年的每日信用管家写「2020/01/16 消费人民币 ￥xxx 明细如下」，
+# 且发送比消费晚 1–2 天；不认这个措辞会把交易日期错记成发送日
+SPEND_DATE_RE = re.compile(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\s*消费")
 
 KINDS = ("消费", "退货", "退款", "还款", "取现", "预授权", "分期", "转账", "费用", "利息",
          "冲正", "邮购")
@@ -268,31 +276,38 @@ def _cells(msg) -> list[str]:
     return out
 
 
+def _currency_amount(text: str) -> tuple[str, float] | None:
+    """带币种与符号的金额：返回 (ISO 币种,  signed 金额)。
+
+    无币种前缀默认 CNY；负数表示资金退回（退货/冲正）。
+    HKD/USD 等外币原样返回，由 db 层单独入库，不混进人民币口径。
+    """
+    m = AMOUNT_RE.match(text.strip())
+    if not m:
+        return None
+    token = m.group(1) or ""
+    ccy = CURRENCY_ALIASES.get(token, token)
+    try:
+        value = float(m.group(3).replace(",", ""))
+    except ValueError:
+        return None
+    return ccy, (-value if m.group(2) == "-" else value)
+
+
 def _to_amount(text: str) -> float | None:
     """金额绝对值。
 
     退货/冲正在银行邮件里写作「CNY -201.50」，负号不参与绝对值，
     方向由 sign 字段承载；要判断方向用 _signed_amount。
     """
-    m = AMOUNT_RE.match(text.strip())
-    if not m:
-        return None
-    try:
-        return float(m.group(2).replace(",", ""))
-    except ValueError:
-        return None
+    r = _currency_amount(text)
+    return abs(r[1]) if r else None
 
 
 def _signed_amount(text: str) -> float | None:
     """带符号金额：负数表示资金退回（退货/冲正）。"""
-    m = AMOUNT_RE.match(text.strip())
-    if not m:
-        return None
-    try:
-        value = float(m.group(2).replace(",", ""))
-    except ValueError:
-        return None
-    return -value if m.group(1) == "-" else value
+    r = _currency_amount(text)
+    return r[1] if r else None
 
 
 def _money(text: str) -> float | None:
@@ -368,23 +383,27 @@ def parse_email(path: str) -> dict:
             mail_dt = None
 
     cells = _cells(msg)
+    # 交易日期优先取正文：先认「您的消费明细」，再认「YYYY/MM/DD 消费」，
+    # 都没有才退回邮件日期（发送可能比消费晚 1–2 天）
     bill_day = None
+    spend_day = None
     for c in cells:
         bm = BILL_DATE_RE.search(c)
         if bm:
-            try:
-                bill_day = f"{bm.group(1)}-{bm.group(2)}-{bm.group(3)}"
-            except Exception:
-                pass
+            bill_day = f"{bm.group(1)}-{bm.group(2)}-{bm.group(3)}"
             break
-    default_day = bill_day or (mail_dt.strftime("%Y-%m-%d") if mail_dt else "")
+        if spend_day is None:
+            sm = SPEND_DATE_RE.search(c)
+            if sm:
+                spend_day = f"{sm.group(1)}-{int(sm.group(2)):02d}-{int(sm.group(3)):02d}"
+    default_day = bill_day or spend_day or (mail_dt.strftime("%Y-%m-%d") if mail_dt else "")
 
     txs: list[dict] = []
     txs_a: list[dict] = []
     n = len(cells)
 
     def push(bucket, seen, card, day, clock, kind, channel, merchant, amount, source,
-             state="", neg=False):
+             state="", neg=False, ccy="CNY"):
         if amount is None or not merchant:
             return
         amount = abs(amount)
@@ -395,7 +414,7 @@ def parse_email(path: str) -> dict:
         bucket.append({
             "card": card, "date": day, "time": clock, "kind": kind,
             "channel": channel, "merchant": merchant, "amount": round(amount, 2),
-            "layout": source, "state": state, "neg": neg,
+            "layout": source, "state": state, "neg": neg, "currency": ccy,
         })
 
     seen_b: set[tuple] = set()
@@ -409,12 +428,15 @@ def parse_email(path: str) -> dict:
         amount = None
         desc = None
         neg = False
+        ccy = "CNY"
         for j in range(i + 1, min(i + 7, n)):
             if amount is None:
-                a = _signed_amount(cells[j])
-                if a is not None and ("," in cells[j] or "." in cells[j] or "CNY" in cells[j]):
-                    amount = a
-                    neg = a < 0
+                parsed = _currency_amount(cells[j])
+                # 裸整数（日期、积分）不当金额；带币种码的除外
+                if parsed is not None and ("," in cells[j] or "." in cells[j]
+                                           or "CNY" in cells[j] or parsed[0] != "CNY"):
+                    ccy, amount = parsed
+                    neg = amount < 0
                     continue
             if desc is None and ("尾号" in cells[j] or any(k in cells[j] for k in KINDS)):
                 if not _to_amount(cells[j]) and len(cells[j]) > 2:
@@ -426,7 +448,7 @@ def parse_email(path: str) -> dict:
         cm = CARD_TAIL_RE.search(desc)
         kind, channel, merchant, state = _split_desc(desc)
         push(txs_b, seen_b, cm.group(1) if cm else "", default_day, cell,
-             kind, channel, merchant, amount, "B", state, neg)
+             kind, channel, merchant, amount, "B", state, neg, ccy)
 
     # 版式 A：卡号 → 日期 → 时间 → 币种 → 描述 → 金额
     for i, cell in enumerate(cells):
@@ -440,9 +462,11 @@ def parse_email(path: str) -> dict:
         amount = _signed_amount(cells[i + 5])
         if amount is None or "币" not in currency:
             continue
+        # 币别列决定币种；未知币别原样保留，由 db 层单列，不混进人民币
+        ccy = CCY_CN.get(currency.strip(), currency.strip())
         kind, channel, merchant, state = _split_desc(desc)
         push(txs_a, seen_a, cell, f"{day[:4]}-{day[4:6]}-{day[6:]}", clock,
-             kind, channel, merchant, amount, "A", state, amount < 0)
+             kind, channel, merchant, amount, "A", state, amount < 0, ccy)
 
     # 老版式邮件里，版式 B 也会误命中同一笔，故 A 命中时以 A 为准（日期与卡号更准）
     txs = txs_a if txs_a else txs_b

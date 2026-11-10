@@ -294,7 +294,7 @@ cmb-insight/
 ├── SCHEMA.md                       数据库逐列说明（表/列/枚举/口径陷阱）
 ├── data/cmb.db                     SQLite 库（本地生成，不入库）
 ├── mcp/
-│   ├── db.py                       建表 + 导入 + 查询层（核心，schema v4）
+│   ├── db.py                       建表 + 导入 + 查询层（核心，schema v5）
 │   ├── cmb_parse.py                .eml → 交易记录（版式 A/B 解析）
 │   ├── server.py                   MCP 服务端（stdio，零依赖）
 │   ├── launch.sh                   启动器：探测 Python 解释器后 exec（macOS/Linux）
@@ -333,7 +333,7 @@ python3 mcp/db.py --sql data/cmb.db "SELECT month, net_amount FROM v_monthly ORD
 
 ### 表结构
 
-> **逐列说明见 [SCHEMA.md](SCHEMA.md)**：5 张表（`mail` / `tx` / `hold` / `bill` / `credit`）加 `meta`、
+> **逐列说明见 [SCHEMA.md](SCHEMA.md)**：6 张表（`mail` / `tx` / `tx_fx` / `hold` / `bill` / `credit`）加 `meta`、
 > `tx_fts`、4 个视图的字段含义、枚举取值、空值语义、口径陷阱和常用查询都在那一份文档里。
 > 这里只留一张速查清单。
 
@@ -342,7 +342,9 @@ mail(id, file, subject, mail_time, mail_date, category, size_bytes,
      tx_count, bill_amount, body_text, imported_at)
 tx(id, mail_id, card, tx_date, tx_time, month, year, dow, hour,
    kind, channel, merchant, amount, sign, signed_amount, layout, state)
-hold(id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout)
+tx_fx(id, mail_id, card, tx_date, tx_time, month, kind, channel, merchant,
+      currency, amount, sign, signed_amount, layout, state)   -- 外币原币，不进 CNY 总额
+hold(id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout, currency)
 bill(id, mail_id, bill_month, cycle_start, cycle_end, due_date, credit_limit,
      due_amount, min_amount, prev_balance, payment, debits, credits, interest, layout)
 credit(id, mail_id, dt, avail_credit, limit_credit, points, card)
@@ -353,6 +355,7 @@ tx_fts(merchant, channel, subject)          -- FTS5 trigram，rowid = tx.id
 - 生成列：`month` / `year` / `dow` / `hour` / `signed_amount` 全部由日期时间自动推算，写入端不用维护。
 - `amount` 存绝对值，`sign` 为 1 或 -1，聚合一律用 `signed_amount`。
 - **预授权不在 `tx`**：占用额度的那笔进 `hold`（不是支出），真正入账的「预授权完成」进 `tx` 并标 `state='预授权完成'`。
+- **外币不在 `tx`**：HKD/USD 等原币入库到 `tx_fx`（邮件没有人民币折算金额），`get_overview` 按币种单报，不与人民币总额相加。
 - **`bill` 是账本级**：来自电子账单表头，`due_amount` 是本期应还（不是消费额）。
 - **`credit` 是额度流水**：来自每日信用管家的可用额度，用来反推真实已用额度；`limit_credit`
   是该封邮件自带的额度（只有老版式能反推出来），有值时优先于账单额度时间线。
@@ -516,6 +519,8 @@ CMB_DB=/path/to/cmb.db      # 数据库位置
 
 - **消费金额是「消费提醒」口径的净额**（消费减退款），不是账单金额；账本级要调 `bills`。
 - **预授权不计入净支出**：只占额度，存在 `hold` 表；`get_overview` 会单独列出笔数与金额。
+- **外币交易原币单列**：邮件里没有人民币折算金额，HKD 等交易存在 `tx_fx`，`get_overview` 的
+  `foreign_currency` 按币种报笔数与净额；聚合工具与面板只统计人民币（`tx`）。
 - **还款数据独立**来自自动还款通知，与消费不同期，不能相减当欠款。
 - **账单周期与交易日期错位一天**：账单按记账日、提醒按交易日，所以每期 `reconcile_diff`
   （账单消费 − 提醒流净支出）通常有几百到几千的差，属正常；差值突然变大才说明提醒流缺邮件。

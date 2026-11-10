@@ -1,7 +1,7 @@
 ---
 name: cmb-consumption-insight
 description: "招商银行信用卡消费分析。当用户问招行信用卡花了多少钱、某月/某年支出多少、钱花在哪些商户、什么时候刷卡最多、找某笔消费、要消费图表，或者要写 SQL 查账单时使用。关键词：招行、招商银行、信用卡账单、消费分析、支出统计、商户排行、账单面板、sqlite 查账单。"
-version: 0.3.0
+version: 0.4.0
 author: leishu
 ---
 
@@ -14,7 +14,7 @@ author: leishu
 
 | 工具 | 用途 |
 |---|---|
-| `get_overview` | 数据口径：邮件数、交易笔数、时间跨度、净支出、退款、还款合计、卡号分布、**数据体检**（缺月/低覆盖月） |
+| `get_overview` | 数据口径：邮件数、交易笔数、时间跨度、净支出、退款、还款合计、卡号分布、**外币单列**、**数据体检**（缺月/低覆盖月） |
 | `aggregate` | 单维度聚合，9 个维度：year/month/weekday/hour/kind/channel/merchant/card/amount_bucket；可再用 `since`/`until`/`kind`/`card`/`merchant` 过滤 |
 | `top_merchants` | 商户排行（按净金额） |
 | `compare` | **环比/同比**：本期 vs 上期或去年同期的差额与变化率，`by` 指定维度可直接给出「主要变动项」 |
@@ -27,23 +27,25 @@ author: leishu
 
 ## 库结构
 
-六张表：一封邮件 = `mail` 一行，明细/额度/账单/预授权各自挂钩到 `mail_id`。
+七张表：一封邮件 = `mail` 一行，明细/外币/额度/账单/预授权各自挂钩到 `mail_id`。
 
 ```
 mail   (id, file, subject, mail_time, category, size_bytes,
         tx_count, bill_amount, body_text, imported_at)
 tx     (id, mail_id, card, tx_date, tx_time, kind, channel, merchant,
-        amount, sign, layout, state)
-hold   (id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout)
+        amount, sign, layout, state)          -- 仅人民币
+tx_fx  (id, mail_id, card, tx_date, tx_time, kind, channel, merchant,
+        currency, amount, sign, layout, state) -- 外币原币，currency 如 HKD
+hold   (id, mail_id, card, tx_date, tx_time, merchant, channel, amount, state, layout, currency)
 bill   (id, mail_id, bill_month, cycle_start, cycle_end, due_date, credit_limit,
         due_amount, min_amount, prev_balance, payment, debits, credits, interest, layout)
 credit (id, mail_id, dt, avail_credit, limit_credit, points, card)
-meta   (key, value)   -- schema_version / *_count / last_sync / mail_dir
+meta   (key, value)   -- schema_version / *_count（含 tx_fx_count）/ last_sync / mail_dir
 ```
 
 **生成列**（`pragma table_info` 里看不到，但可以直接查，永远别手动写、别 INSERT）：
 `mail.mail_date`（= `substr(mail_time,1,10)`）；`tx.month`(YYYY-MM) / `tx.year` / `tx.dow`(0=周日) /
-`tx.hour` / `tx.signed_amount`。日期过滤优先用生成列，别在 `tx_date` 上做字符串函数。
+`tx.hour` / `tx.signed_amount`；`tx_fx` 只有 `month` / `signed_amount`。日期过滤优先用生成列，别在 `tx_date` 上做字符串函数。
 
 ```
 视图：v_tx（tx + 邮件的 category/subject）/ v_monthly / v_merchant / v_channel
@@ -55,7 +57,8 @@ meta   (key, value)   -- schema_version / *_count / last_sync / mail_dir
 | 表 | 装什么 | 什么时候查 |
 |---|---|---|
 | `mail` | 邮件本身（主题、时间、分类、正文） | 追数据来源、查某封信解析是否正常 |
-| `tx` | 真正入账的交易明细 | 几乎所有消费统计 |
+| `tx` | 真正入账的人民币交易明细 | 几乎所有消费统计 |
+| `tx_fx` | 外币交易（HKD 等），**原币金额** | 问外币消费；不能与 `tx` 金额相加 |
 | `hold` | 预授权冻结，只占额度、**不算支出** | 问「为什么可用额度少了但没扣钱」 |
 | `bill` | 每期账单（额度、应还、最低、到期日、消费/退款/利息） | 账本级数字只能从这来 |
 | `credit` | 额度快照（可用额度、信用额度、积分） | 额度曲线、使用率 |
@@ -99,11 +102,14 @@ SELECT year, merchant, total FROM (
 4. **还款数据独立**：来自「自动还款扣款通知」，与消费不同期，不能直接相减当作欠款。
 5. **账本级数只能来自 `bills`**：额度、应还、最低还款、到期日、利息都不是提醒流能算出来的。
 6. **时间以邮件内交易时间为准**，不是邮件发送时间。
-7. **`mail.tx_count` 不含 `hold`**：一封只发了预授权冻结的邮件 `tx_count = 0`，但它不是空邮件，
-   查「有没有漏解析」时要把 `hold` 一起算进去。
+7. **`mail.tx_count` 不含 `hold`（但含 `tx_fx`）**：一封只发了预授权冻结的邮件 `tx_count = 0`，
+   但它不是空邮件，查「有没有漏解析」时要把 `hold` 一起算进去。
 8. **数据可能缺月**：`get_overview` 里的 `data_quality` 会标出低覆盖月（如某月只有 3 笔），
    回答趋势类问题时若用户问到的月份在名单里，要主动说明「该月邮件可能缺失」。
-9. **2017–2019 的额度是反推值**：老版式模板的标签是图片，额度由「已用 + 可用」相加得出，
+9. **外币原币单列，不进人民币总额**：邮件里没有人民币折算金额，HKD 等交易存 `tx_fx`。
+   `get_overview` 的 `foreign_currency` 按币种单报；`aggregate`/`top_merchants`/面板只统计 `tx`（CNY）。
+   `search_transactions` 会同时搜两张表，每条带 `currency`，外币净额在 `foreign_net` 里单列。
+10. **2017–2019 的额度是反推值**：老版式模板的标签是图片，额度由「已用 + 可用」相加得出，
    取不到时宁可为空；与账单 `credit_limit` 不一致时以邮件自带值为准。
 
 ## 回答套路
@@ -126,6 +132,6 @@ SELECT year, merchant, total FROM (
 
 ## 注意
 
-- 金额单位是人民币元，展示时保留两位小数。
+- 金额单位是人民币元（`tx_fx` 除外，那是原币），展示时保留两位小数。
 - 用户说「上次」「最近」时，先确认当前日期，再用 `since` 过滤，别默认全年。
 - 面板数据是打开那一刻的快照；新增邮件后先跑 `python mcp/db.py 招商银行 data/cmb.db` 增量导入，再重新 `open_dashboard`。
