@@ -43,7 +43,7 @@ WorkBuddy 只认「市场」下的插件：市场根目录里要有 `.codebuddy-
 ```bash
 mkdir -p ~/cmb-market
 cd ~/cmb-market
-git clone https://github.com/<your-name>/cmb-insight.git cmb-insight
+git clone https://github.com/leishu/cmb-insight.git cmb-insight
 ```
 
 ```
@@ -306,7 +306,7 @@ cmb-insight/
 ## 一、把邮件导入 SQLite
 
 ```bash
-# 首次全量导入（3177 封约 18 秒）
+# 首次全量导入（数千封约数十秒）
 python3 mcp/db.py ../招商银行 data/cmb.db
 
 # 增量导入：只处理新增或大小变化的邮件，其余跳过
@@ -339,7 +339,7 @@ tx(id, mail_id, card, tx_date, tx_time, month, year, dow, hour,
 
 ### 导入的两个处理
 
-**商户名跨邮件归一**：银行在短信体里截断商户名，同一家店会裂成 "北京轨道交通路网管理有限" 和 "...有限公司"。导入末尾统一做一次前缀合并（短名 ≥ 8 字、是长名前缀、长度差 ≤ 6），本次合并了 1126 行。
+**商户名跨邮件归一**：银行在短信体里截断商户名，同一家店会裂成 "北京轨道交通路网管理有限" 和 "...有限公司"。导入末尾统一做一次前缀合并（短名 ≥ 8 字、是长名前缀、长度差 ≤ 6），实测能合并上千行。
 
 **退款符号**：`parse_email` 只做抽取，`sign = -1` 由 db 层按 `kind == '退款'` 打上。漏了这步，净支出会等于原额。
 
@@ -382,7 +382,7 @@ cd dashboard && npm run build
 <script id="cmb-data" type="text/plain">__CMB_DATA_B64__</script>
 ```
 
-`server.render_dashboard()` 读取该文件，把 `db.dashboard_payload()` 的结果 JSON → gzip → base64 后替换进去。前端用 `DecompressionStream` 解压。8809 笔交易压缩后约 200 KB，整页约 1 MB。
+`server.render_dashboard()` 读取该文件，把 `db.dashboard_payload()` 的结果 JSON → gzip → base64 后替换进去。前端用 `DecompressionStream` 解压。近万笔交易压缩后约 200 KB，整页约 1 MB。
 
 > 之所以不选明文 JSON：明文要 800 KB，gzip 后 200 KB，差值就是加载速度。
 
@@ -423,7 +423,7 @@ CMB_PYTHON=/path/to/python3 sh mcp/launch.sh   # 显式指定，不合格直接�
 - **只用 shell 内建**（`cd`/`pwd`/`case`/`[ ]`），不依赖 `dirname`、`ls`、`sort`。MCP 客户端给的环境变量可能很精简，`env -i PATH=/nonexistent` 下也能正常探测。
 - 探测完用 `exec` 替换进程，stdin/stdout 和信号原样透传给 `server.py`。
 
-Windows 用 `mcp/launch.cmd`（`CMB_PYTHON` → `py -3` → `python`），但这份没有在实际 Windows 上验证过。
+**Windows 目前起不来**：`plugin.json` 里写的是 `command: /bin/sh`，Windows 没有这个 shell。仓库里附了 `mcp/launch.cmd`，但需要你自己把 `command` 改成 `cmd`、`args` 改成 `["${CODEBUDDY_PLUGIN_ROOT}\\mcp\\launch.cmd"]`，且**这份未经实测**，仅作改造参考。
 
 在 `plugin.json` 里这样声明：
 

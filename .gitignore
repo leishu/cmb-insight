@@ -32,5 +32,7 @@ venv/
 *.local.json
 *.bak-*
 
-# 项目排除路径
-/dashboard/dist/
+# ---- 构建产物：入库 ----
+# dashboard/dist/index.html 是 MCP App 返回的 ui:// 资源，随仓库提供，clone 后不必装 Node 即可使用。
+# 产物里只有 __CMB_DATA_B64__ 占位符（真实数据由 server.py 运行时注入），不含任何账单信息。
+# 改了 dashboard/src/ 记得重新 npm run build 并一起提交。
