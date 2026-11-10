@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "cmb-insight",
+  "version": "0.2.0",
+  "description": "招商银行信用卡邮件洞察：把导出的 .eml 解析进 SQLite，提供汇总/检索/只读 SQL 工具，以及一个 Vue3 + ECharts 的可交互消费面板（MCP App）。",
+  "author": {
+    "name": "leishu"
+  },
+  "license": "MIT",
+  "category": "data",
+  "keywords": [
+    "招商银行",
+    "信用卡",
+    "账单",
+    "sqlite",
+    "消费分析",
+    "mcp-app",
+    "echarts",
+    "eml"
+  ],
+  "mcpServers": {
+    "cmb-insight": {
+      "command": "/bin/sh",
+      "args": [
+        "${CODEBUDDY_PLUGIN_ROOT}/mcp/launch.sh"
+      ],
+      "env": {
+        "CMB_DB": "${CODEBUDDY_PLUGIN_ROOT}/data/cmb.db"
+      }
+    }
+  },
+  "skills": "./skills",
+  "commands": "./commands"
+}

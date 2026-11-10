@@ -1,0 +1,36 @@
+# ---- 个人数据：绝不上传 ----
+# 导出的 SQLite 库、解析缓存、离线预览页都含真实交易 / 商户 / 卡号尾号
+data/
+.cache/
+dashboard/data.dev.json
+dashboard-preview.html
+*.eml
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# ---- 依赖 ----
+node_modules/
+dashboard/node_modules/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- 本地覆盖 ----
+*.local.json
+*.bak-*
+
+# 项目排除路径
+/dashboard/dist/

@@ -1,0 +1,683 @@
+"""把招商银行信用卡邮件（.eml）导入 SQLite。
+
+设计要点
+--------
+* 两张主表：``mail``（每封邮件一行，含正文纯文本）与 ``tx``（每笔交易一行）。
+* 生成列：``month`` / ``year`` / ``dow`` / ``hour`` / ``signed_amount`` 由
+  ``tx_date``、``tx_time``、``amount``、``sign`` 自动推算，写入端不必维护。
+* ``tx_fts``：FTS5 + trigram 分词，支持中文子串检索（"星巴克"能命中
+  "星巴克咖啡（国贸店）"）。unicode61 对中文整段当 token，不适用。
+* 增量导入：按文件名 + 文件大小判断是否需要重导；给出 ``--rebuild`` 可全量重建。
+* 商户别名归一放在导入末尾统一做一次（跨邮件合并被截断的商户名），
+  保证增量导入与全量导入结果一致。
+
+命令行
+------
+    python db.py <邮件目录> [数据库路径]          # 增量导入
+    python db.py <邮件目录> [数据库路径] --rebuild  # 全量重建
+    python db.py --stats <数据库路径>              # 看统计
+    python db.py --sql <数据库路径> "SELECT ..."    # 跑只读 SQL
+"""
+
+from __future__ import annotations
+
+import glob
+import hashlib
+import html
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+
+# 允许作为脚本直接运行（python db.py ...）时同目录导入
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from cmb_parse import parse_email  # noqa: E402
+
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DB = os.path.join(PLUGIN_ROOT, "data", "cmb.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mail (
+    id          INTEGER PRIMARY KEY,
+    file        TEXT NOT NULL UNIQUE,
+    subject     TEXT NOT NULL DEFAULT '',
+    mail_time   TEXT NOT NULL DEFAULT '',          -- YYYY-MM-DD HH:MM:SS
+    mail_date   TEXT GENERATED ALWAYS AS (substr(mail_time, 1, 10)) STORED,
+    category    TEXT NOT NULL DEFAULT '',          -- 消费提醒 / 每日信用管家 / 自动还款 / 电子账单
+    size_bytes  INTEGER NOT NULL DEFAULT 0,
+    tx_count    INTEGER NOT NULL DEFAULT 0,
+    bill_amount REAL,                              -- 实扣/账单金额，仅还款、账单类
+    body_text   TEXT NOT NULL DEFAULT '',          -- 正文纯文本，供全文检索
+    imported_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS tx (
+    id            INTEGER PRIMARY KEY,
+    mail_id       INTEGER NOT NULL REFERENCES mail(id) ON DELETE CASCADE,
+    card          TEXT NOT NULL DEFAULT '',        -- 卡号后四位
+    tx_date       TEXT NOT NULL,                   -- YYYY-MM-DD
+    tx_time       TEXT NOT NULL DEFAULT '',        -- HH:MM:SS
+    month         TEXT GENERATED ALWAYS AS (substr(tx_date, 1, 7)) STORED,
+    year          INTEGER GENERATED ALWAYS AS (CAST(substr(tx_date, 1, 4) AS INTEGER)) STORED,
+    dow           INTEGER GENERATED ALWAYS AS (CAST(strftime('%w', tx_date) AS INTEGER)) STORED,
+    hour          INTEGER GENERATED ALWAYS AS (CAST(COALESCE(NULLIF(substr(tx_time, 1, 2), ''), '0') AS INTEGER)) STORED,
+    kind          TEXT NOT NULL DEFAULT '',        -- 消费 / 退款 / 还款 / 取现 ...
+    channel       TEXT NOT NULL DEFAULT '',        -- 微信支付 / 支付宝 / 银联 ...
+    merchant      TEXT NOT NULL DEFAULT '',
+    amount        REAL NOT NULL,                   -- 绝对值
+    sign          INTEGER NOT NULL DEFAULT 1,      -- 1 支出，-1 退款
+    signed_amount REAL GENERATED ALWAYS AS (round(amount * sign, 2)) STORED,
+    layout        TEXT NOT NULL DEFAULT ''         -- 来源版式 A/B，便于排查解析问题
+);
+
+CREATE INDEX IF NOT EXISTS idx_tx_date     ON tx(tx_date);
+CREATE INDEX IF NOT EXISTS idx_tx_month    ON tx(month);
+CREATE INDEX IF NOT EXISTS idx_tx_year     ON tx(year);
+CREATE INDEX IF NOT EXISTS idx_tx_dow      ON tx(dow);
+CREATE INDEX IF NOT EXISTS idx_tx_merchant ON tx(merchant);
+CREATE INDEX IF NOT EXISTS idx_tx_kind     ON tx(kind);
+CREATE INDEX IF NOT EXISTS idx_tx_channel  ON tx(channel);
+CREATE INDEX IF NOT EXISTS idx_tx_card     ON tx(card);
+CREATE INDEX IF NOT EXISTS idx_tx_mail     ON tx(mail_id);
+CREATE INDEX IF NOT EXISTS idx_mail_date   ON mail(mail_date);
+CREATE INDEX IF NOT EXISTS idx_mail_cat    ON mail(category);
+
+-- 中文子串检索：trigram 分词，查询串需 >= 3 字符
+CREATE VIRTUAL TABLE IF NOT EXISTS tx_fts USING fts5(
+    merchant, channel, subject,
+    tokenize = 'trigram'
+);
+
+CREATE VIEW IF NOT EXISTS v_tx AS
+SELECT t.id,
+       t.tx_date,
+       t.tx_time,
+       t.month,
+       t.year,
+       t.dow,
+       CASE t.dow WHEN 0 THEN '周日' WHEN 1 THEN '周一' WHEN 2 THEN '周二'
+                  WHEN 3 THEN '周三' WHEN 4 THEN '周四' WHEN 5 THEN '周五'
+                  ELSE '周六' END AS weekday,
+       t.hour,
+       t.card,
+       t.kind,
+       t.channel,
+       t.merchant,
+       t.amount,
+       t.sign,
+       t.signed_amount,
+       m.category AS mail_category,
+       m.subject  AS mail_subject,
+       m.mail_time
+FROM tx t
+JOIN mail m ON m.id = t.mail_id;
+
+CREATE VIEW IF NOT EXISTS v_monthly AS
+SELECT month,
+       COUNT(*)                              AS tx_count,
+       ROUND(SUM(signed_amount), 2)          AS net_amount,
+       ROUND(SUM(amount), 2)                 AS gross_amount
+FROM tx
+GROUP BY month;
+
+CREATE VIEW IF NOT EXISTS v_merchant AS
+SELECT merchant,
+       COUNT(*)                              AS tx_count,
+       ROUND(SUM(signed_amount), 2)          AS net_amount,
+       ROUND(AVG(amount), 2)                 AS avg_amount,
+       ROUND(MAX(amount), 2)                 AS max_amount
+FROM tx
+WHERE merchant <> ''
+GROUP BY merchant;
+
+CREATE VIEW IF NOT EXISTS v_channel AS
+SELECT channel,
+       COUNT(*)                              AS tx_count,
+       ROUND(SUM(signed_amount), 2)          AS net_amount
+FROM tx
+GROUP BY channel;
+"""
+
+DIMENSIONS = {
+    "month": "t.month",
+    "year": "CAST(t.year AS TEXT)",
+    "weekday": ("CASE t.dow WHEN 0 THEN '周日' WHEN 1 THEN '周一' WHEN 2 THEN '周二'"
+                " WHEN 3 THEN '周三' WHEN 4 THEN '周四' WHEN 5 THEN '周五' ELSE '周六' END"),
+    "hour": "CAST(t.hour AS TEXT)",
+    "kind": "COALESCE(NULLIF(t.kind, ''), '未分类')",
+    "channel": "COALESCE(NULLIF(t.channel, ''), '未标注')",
+    "merchant": "t.merchant",
+    "card": "NULLIF(t.card, '')",
+    # 与前端 BUCKETS 保持一致，共 9 档
+    "amount_bucket": (
+        "CASE WHEN t.amount < 10 THEN '≤10' WHEN t.amount < 30 THEN '10-30'"
+        " WHEN t.amount < 50 THEN '30-50' WHEN t.amount < 100 THEN '50-100'"
+        " WHEN t.amount < 200 THEN '100-200' WHEN t.amount < 500 THEN '200-500'"
+        " WHEN t.amount < 1000 THEN '500-1k' WHEN t.amount < 3000 THEN '1k-3k'"
+        " ELSE '>3k' END"
+    ),
+}
+
+
+# --------------------------------------------------------------------------- #
+# 连接与建表
+# --------------------------------------------------------------------------- #
+
+def db_label(path: str) -> str:
+    """插件内的库显示成 data/cmb.db，外部路径原样返回。"""
+    if not path:
+        return ""
+    rel = os.path.relpath(path, PLUGIN_ROOT)
+    return path if rel.startswith("..") else rel
+
+
+def connect(db_path: str) -> sqlite3.Connection:
+    """打开（并按需创建）数据库，返回已配置好的连接。"""
+    parent = os.path.dirname(os.path.abspath(db_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    init_schema(conn)
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# 正文提取
+# --------------------------------------------------------------------------- #
+
+def body_text_of(path: str, limit: int = 20000) -> str:
+    """提取邮件正文纯文本：优先 text/plain，其次 text/html 去标签。"""
+    import email
+    from email import policy
+
+    try:
+        with open(path, "rb") as fh:
+            msg = email.message_from_bytes(fh.read(), policy=policy.default)
+    except Exception:
+        return ""
+
+    plain, rich = [], []
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            try:
+                plain.append(part.get_content())
+            except Exception:
+                pass
+        elif ctype == "text/html":
+            try:
+                rich.append(part.get_content())
+            except Exception:
+                pass
+
+    if plain:
+        text = "\n".join(plain)
+    else:
+        text = "\n".join(rich)
+        text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)
+        text = re.sub(r"(?i)<br\s*/?>|</p>|</tr>|</div>", "\n", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = html.unescape(text)
+
+    text = re.sub(r"[ \t\u3000\xa0]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text).strip()
+    return text[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# 导入
+# --------------------------------------------------------------------------- #
+
+def _existing_mails(conn: sqlite3.Connection) -> dict[str, int]:
+    return {r["file"]: r["size_bytes"]
+            for r in conn.execute("SELECT file, size_bytes FROM mail")}
+
+
+def _delete_mail(conn: sqlite3.Connection, mail_id: int) -> None:
+    conn.execute("DELETE FROM tx_fts WHERE rowid IN (SELECT id FROM tx WHERE mail_id = ?)",
+                 (mail_id,))
+    conn.execute("DELETE FROM mail WHERE id = ?", (mail_id,))
+
+
+def _insert_mail(conn: sqlite3.Connection, rec: dict, path: str) -> int:
+    body = body_text_of(path)
+    cur = conn.execute(
+        """INSERT INTO mail (file, subject, mail_time, category, size_bytes,
+                             tx_count, bill_amount, body_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (rec["file"], rec["subject"], rec["mail_time"], rec["category"],
+         rec["size"], rec["tx_count"], rec["repay_amount"], body),
+    )
+    mail_id = cur.lastrowid
+    rows, fts = [], []
+    for t in rec["txs"]:
+        # parse_email 只做抽取，退款打负号这一步在 db 层完成
+        sign = t.get("sign") or (-1 if t["kind"] == "退款" else 1)
+        rows.append((mail_id, t["card"], t["date"], t["time"], t["kind"],
+                     t["channel"], t["merchant"], t["amount"], sign,
+                     t.get("layout", "")))
+    conn.executemany(
+        """INSERT INTO tx (mail_id, card, tx_date, tx_time, kind, channel,
+                           merchant, amount, sign, layout)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    for t in rec["txs"]:
+        fts.append((t["merchant"], t["channel"], rec["subject"]))
+    # 用最近插入的 tx 行 id 与 fts 行对齐
+    ids = [r[0] for r in conn.execute(
+        "SELECT id FROM tx WHERE mail_id = ? ORDER BY id", (mail_id,))]
+    conn.executemany(
+        "INSERT INTO tx_fts (rowid, merchant, channel, subject) VALUES (?, ?, ?, ?)",
+        [(i, m, c, s) for i, (m, c, s) in zip(ids, fts)],
+    )
+    return mail_id
+
+
+def normalize_merchants(conn: sqlite3.Connection) -> int:
+    """跨邮件合并被上游截断的商户名（如「北京轨道交通路网管理有限」→ 全称）。
+
+    返回被改写的交易行数。规则：短名 >= 8 字且是长名前缀，长度差 <= 6。
+    """
+    names = [r[0] for r in conn.execute(
+        "SELECT DISTINCT merchant FROM tx WHERE merchant <> ''")]
+    if not names:
+        return 0
+    alias: dict[str, str] = {}
+    ordered = sorted(names, key=len, reverse=True)
+    for long_name in ordered:
+        for short in names:
+            if short == long_name or short in alias:
+                continue
+            if len(short) >= 8 and long_name.startswith(short) \
+                    and len(long_name) - len(short) <= 6:
+                alias[short] = long_name
+
+    changed = 0
+    for short, long_name in alias.items():
+        # 解链，避免 a→b、b→c 时只走一步
+        final = long_name
+        seen = {short}
+        while final in alias and final not in seen:
+            seen.add(final)
+            final = alias[final]
+        cur = conn.execute("UPDATE tx SET merchant = ? WHERE merchant = ?", (final, short))
+        changed += cur.rowcount
+    return changed
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    conn.execute("DELETE FROM tx_fts")
+    conn.execute(
+        """INSERT INTO tx_fts (rowid, merchant, channel, subject)
+           SELECT t.id, t.merchant, t.channel, m.subject
+           FROM tx t JOIN mail m ON m.id = t.mail_id"""
+    )
+    return conn.execute("SELECT COUNT(*) FROM tx_fts").fetchone()[0]
+
+
+def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
+               quiet: bool = False) -> dict:
+    """把目录下所有 .eml 导入数据库，返回统计信息。"""
+    files = sorted(glob.glob(os.path.join(mail_dir, "*.eml")))
+    if not files:
+        raise SystemExit(f"目录里没有 .eml：{mail_dir}")
+
+    conn = connect(db_path)
+    if rebuild:
+        conn.executescript("DROP VIEW IF EXISTS v_tx; DROP VIEW IF EXISTS v_monthly;"
+                           " DROP VIEW IF EXISTS v_merchant; DROP VIEW IF EXISTS v_channel;"
+                           " DROP TABLE IF EXISTS tx_fts; DROP TABLE IF EXISTS tx;"
+                           " DROP TABLE IF EXISTS mail; DROP TABLE IF EXISTS meta;")
+        conn.commit()
+        init_schema(conn)
+
+    existing = _existing_mails(conn)
+    added = updated = skipped = failed = 0
+    started = datetime.now()
+
+    for path in files:
+        base = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            failed += 1
+            continue
+
+        if base in existing and not rebuild:
+            if existing[base] == size:
+                skipped += 1
+                continue
+            conn.execute("DELETE FROM tx_fts WHERE rowid IN "
+                         "(SELECT id FROM tx WHERE mail_id = "
+                         "(SELECT id FROM mail WHERE file = ?))", (base,))
+            conn.execute("DELETE FROM mail WHERE file = ?", (base,))
+            updated += 1
+        elif base in existing:
+            updated += 1
+        else:
+            added += 1
+
+        try:
+            rec = parse_email(path)
+        except Exception as exc:
+            failed += 1
+            if not quiet:
+                print(f"  解析失败 {base}: {exc}", file=sys.stderr)
+            continue
+        _insert_mail(conn, rec, path)
+
+    conn.commit()
+    changed = normalize_merchants(conn)
+    if changed:
+        rebuild_fts(conn)
+    conn.commit()
+
+    total_tx = conn.execute("SELECT COUNT(*) FROM tx").fetchone()[0]
+    total_mail = conn.execute("SELECT COUNT(*) FROM mail").fetchone()[0]
+    conn.executemany(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [("mail_dir", os.path.abspath(mail_dir)),
+         ("last_sync", started.strftime("%Y-%m-%d %H:%M:%S")),
+         ("mail_count", str(total_mail)),
+         ("tx_count", str(total_tx)),
+         ("schema_version", "1")],
+    )
+    conn.commit()
+
+    info = {
+        "db": os.path.abspath(db_path),
+        "db_bytes": os.path.getsize(db_path) if os.path.exists(db_path) else 0,
+        "mail_total": total_mail,
+        "tx_total": total_tx,
+        "added": added,
+        "updated": updated,
+        "skipped": skipped,
+        "failed": failed,
+        "merchant_merged": changed,
+        "elapsed": round((datetime.now() - started).total_seconds(), 2),
+    }
+    conn.close()
+    if not quiet:
+        print(f"数据库：{info['db']}（{info['db_bytes'] / 1024 / 1024:.1f} MB）")
+        print(f"邮件 {total_mail} 封 · 交易 {total_tx} 笔")
+        print(f"新增 {added} · 更新 {updated} · 跳过 {skipped} · 失败 {failed} "
+              f"· 商户名合并 {changed} 行 · 耗时 {info['elapsed']}s")
+    return info
+
+
+# --------------------------------------------------------------------------- #
+# 查询层（供 MCP 复用）
+# --------------------------------------------------------------------------- #
+
+def _filters(since=None, until=None, kind=None, channel=None, card=None,
+             keyword=None, merchant=None) -> tuple[str, list]:
+    where, params = ["1=1"], []
+    if since:
+        where.append("t.tx_date >= ?")
+        params.append(since)
+    if until:
+        where.append("t.tx_date <= ?")
+        params.append(until)
+    if kind:
+        where.append("t.kind = ?")
+        params.append(kind)
+    if channel:
+        where.append("t.channel = ?")
+        params.append(channel)
+    if card:
+        where.append("t.card = ?")
+        params.append(card)
+    if merchant:
+        where.append("t.merchant LIKE ?")
+        params.append(f"%{merchant}%")
+    if keyword:
+        where.append("(t.merchant LIKE ? OR t.channel LIKE ?)")
+        params.extend([f"%{keyword}%", f"%{keyword}%"])
+    return " AND ".join(where), params
+
+
+def overview(conn: sqlite3.Connection) -> dict:
+    base = conn.execute(
+        """SELECT COUNT(*) tx, ROUND(SUM(signed_amount), 2) net, ROUND(SUM(amount), 2) gross,
+                  MIN(tx_date) first_day, MAX(tx_date) last_day,
+                  COUNT(DISTINCT merchant) merchants, COUNT(DISTINCT card) cards,
+                  ROUND(AVG(amount), 2) avg_amount
+           FROM tx""").fetchone()
+    repay = conn.execute(
+        "SELECT COUNT(*) n, ROUND(SUM(bill_amount), 2) total FROM mail "
+        "WHERE bill_amount IS NOT NULL").fetchone()
+    mails = conn.execute(
+        "SELECT COUNT(*) n, MIN(mail_time) first_dt, MAX(mail_time) last_dt FROM mail").fetchone()
+    return {
+        "mails": mails["n"],
+        "mail_range": [mails["first_dt"], mails["last_dt"]],
+        "transactions": base["tx"],
+        "net_spend": base["net"],
+        "gross_spend": base["gross"],
+        "tx_date_range": [base["first_day"], base["last_day"]],
+        "avg_amount": base["avg_amount"],
+        "merchants": base["merchants"],
+        "cards": base["cards"],
+        "repay_records": repay["n"],
+        "repay_total": repay["total"],
+    }
+
+
+def aggregate(conn: sqlite3.Connection, dimension: str = "month", since=None,
+              until=None, kind=None, channel=None, card=None, keyword=None,
+              limit: int | None = None) -> list[dict]:
+    """按维度聚合，按净支出降序；dimension 见 DIMENSIONS。"""
+    if dimension not in DIMENSIONS:
+        raise ValueError(f"不支持的维度：{dimension}，可选 {list(DIMENSIONS)}")
+    where, params = _filters(since, until, kind, channel, card, keyword)
+    if dimension in ("month", "year", "hour"):
+        order = "name ASC"
+    elif dimension == "amount_bucket":
+        order = "MIN(t.amount) ASC"  # 区间桶按金额下限排序
+    else:
+        order = "net_amount DESC"
+    sql = f"""
+        SELECT {DIMENSIONS[dimension]} AS name,
+               COUNT(*) AS tx_count,
+               ROUND(SUM(t.signed_amount), 2) AS net_amount,
+               ROUND(SUM(t.amount), 2) AS gross_amount
+        FROM tx t
+        WHERE {where}
+        GROUP BY name
+        HAVING name IS NOT NULL AND name <> ''
+        ORDER BY {order}
+    """
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+def top_merchants(conn: sqlite3.Connection, limit: int = 10, since=None,
+                  until=None, kind=None) -> list[dict]:
+    where, params = _filters(since, until, kind)
+    rows = conn.execute(f"""
+        SELECT t.merchant AS name, COUNT(*) AS tx_count,
+               ROUND(SUM(t.signed_amount), 2) AS net_amount,
+               ROUND(AVG(t.amount), 2) AS avg_amount,
+               ROUND(MAX(t.amount), 2) AS max_amount,
+               MIN(t.tx_date) AS first_date, MAX(t.tx_date) AS last_date
+        FROM tx t
+        WHERE {where} AND t.merchant <> ''
+        GROUP BY t.merchant
+        ORDER BY tx_count DESC
+        LIMIT ?""", [*params, limit])
+    return [dict(r) for r in rows]
+
+
+def search_transactions(conn: sqlite3.Connection, keyword: str | None = None,
+                        since=None, until=None, min_amount=None, max_amount=None,
+                        kind=None, limit: int = 20) -> list[dict]:
+    where, params = _filters(since, until, kind)
+    if keyword:
+        if len(keyword) >= 3:
+            where += (" AND t.id IN (SELECT rowid FROM tx_fts WHERE tx_fts MATCH ?)")
+            params.append('"' + keyword.replace('"', '""') + '"')
+        else:
+            where += " AND (t.merchant LIKE ? OR t.channel LIKE ?)"
+            params.extend([f"%{keyword}%"] * 2)
+    if min_amount is not None:
+        where += " AND t.amount >= ?"
+        params.append(min_amount)
+    if max_amount is not None:
+        where += " AND t.amount <= ?"
+        params.append(max_amount)
+    rows = conn.execute(f"""
+        SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind,
+               t.amount, t.sign, t.card, m.category AS mail_category
+        FROM tx t JOIN mail m ON m.id = t.mail_id
+        WHERE {where}
+        ORDER BY t.tx_date DESC, t.tx_time DESC
+        LIMIT ?""", [*params, limit])
+    return [dict(r) for r in rows]
+
+
+def monthly(conn: sqlite3.Connection) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT month, tx_count, net_amount, gross_amount FROM v_monthly ORDER BY month")]
+
+
+def dashboard_payload(conn: sqlite3.Connection) -> dict:
+    """给面板用的紧凑载荷：数组下标含义见 KNOWN 注释，减少 JSON 体积。"""
+    txs = conn.execute("""
+        SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind,
+               t.amount, t.sign, t.card
+        FROM tx t
+        ORDER BY t.tx_date, t.tx_time""").fetchall()
+    repays = conn.execute("""
+        SELECT mail_date, category, bill_amount
+        FROM mail WHERE bill_amount IS NOT NULL
+        ORDER BY mail_date""").fetchall()
+    meta = overview(conn)
+    # 库文件可能被 CMB_DB 指到别处，面板页眉显示真实位置而不是写死
+    row = conn.execute("PRAGMA database_list").fetchone()
+    meta["db_file"] = db_label(row["file"]) if row else ""
+    return {
+        "meta": meta,
+        "cols": ["date", "time", "merchant", "channel", "kind", "amount", "sign", "card"],
+        "txs": [list(r) for r in txs],
+        "repays": [list(r) for r in repays],
+    }
+
+
+def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
+    """执行只读查询（仅 SELECT / WITH），返回列名与行。"""
+    cleaned = re.sub(r"--[^\n]*", " ", sql)
+    cleaned = re.sub(r"/\*.*?\*/", " ", cleaned, flags=re.S).strip().rstrip(";").strip()
+    if not cleaned:
+        raise ValueError("SQL 为空")
+    head = cleaned.split(None, 1)[0].lower()
+    if head not in ("select", "with", "explain"):
+        raise ValueError("只允许只读查询（SELECT / WITH）")
+    if ";" in cleaned:
+        raise ValueError("一次只能执行一条语句")
+    lowered = cleaned.lower()
+    for bad in ("insert ", "update ", "delete ", "drop ", "alter ", "attach ", "pragma "):
+        if re.search(rf"\b{bad}", lowered):
+            raise ValueError("只允许只读查询，检测到写操作关键字")
+
+    cur = conn.execute(sql)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    rows = cur.fetchmany(limit)
+    return {"columns": cols, "rows": [[_jsonable(v) for v in r] for r in rows],
+            "row_count": len(rows), "truncated": len(rows) == limit}
+
+
+def _jsonable(v):
+    if isinstance(v, bytes):
+        return v.hex()
+    return v
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def _print_table(result: dict, max_rows: int = 30) -> None:
+    cols, rows = result["columns"], result["rows"]
+    if not cols:
+        print("（无结果集）")
+        return
+    widths = [len(c) for c in cols]
+    for r in rows[:max_rows]:
+        for i, v in enumerate(r):
+            widths[i] = max(widths[i], len(str(v)))
+    print(" | ".join(c.ljust(widths[i]) for i, c in enumerate(cols)))
+    print("-+-".join("-" * w for w in widths))
+    for r in rows[:max_rows]:
+        print(" | ".join(str(v).ljust(widths[i]) for i, v in enumerate(r)))
+    if len(rows) > max_rows:
+        print(f"... 共 {len(rows)} 行，已截断显示")
+
+
+def main(argv: list[str]) -> int:
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    flags = {a for a in argv[1:] if a.startswith("--")}
+
+    if "--stats" in flags:
+        db = args[0] if args else DEFAULT_DB
+        conn = connect(db)
+        print("== overview ==")
+        for k, v in overview(conn).items():
+            print(f"  {k:16} {v}")
+        print("\n== 按年 ==")
+        _print_table({"columns": ["year", "tx", "net"],
+                      "rows": [(r["name"], r["tx_count"], r["net_amount"])
+                               for r in aggregate(conn, "year")]})
+        print("\n== 邮件类型 ==")
+        _print_table({"columns": ["category", "count"],
+                      "rows": [tuple(r) for r in conn.execute(
+                          "SELECT category, COUNT(*) FROM mail GROUP BY category "
+                          "ORDER BY 2 DESC")]})
+        print("\n== 数据质量 ==")
+        _print_table({"columns": ["metric", "value"], "rows": [
+            ("交易缺日期", conn.execute("SELECT COUNT(*) FROM tx WHERE tx_date=''").fetchone()[0]),
+            ("交易缺商户", conn.execute("SELECT COUNT(*) FROM tx WHERE merchant=''").fetchone()[0]),
+            ("交易缺渠道", conn.execute("SELECT COUNT(*) FROM tx WHERE channel=''").fetchone()[0]),
+            ("FTS 行数", conn.execute("SELECT COUNT(*) FROM tx_fts").fetchone()[0]),
+        ]})
+        conn.close()
+        return 0
+
+    if "--sql" in flags:
+        if len(args) < 2:
+            print('用法：python db.py --sql <数据库> "SELECT ..."', file=sys.stderr)
+            return 2
+        conn = connect(args[0])
+        _print_table(run_sql(conn, args[1]))
+        conn.close()
+        return 0
+
+    mail_dir = args[0] if args else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "招商银行")
+    db = args[1] if len(args) > 1 else DEFAULT_DB
+    info = import_dir(mail_dir, db, rebuild="--rebuild" in flags)
+    if "--json" in flags:
+        print(hashlib.sha1(b"").hexdigest()[:0], info)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
