@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
-  amountHist, byChannel, byKind, byMerchant, byMonth, decode,
+  amountHist, applyFilters, byChannel, byKind, byMerchant, byMonth, decode,
   facetOptions, fmtMoney, fmtShort, heatGrid, loadPayload, periodCompare, summarize, WEEK
 } from './logic/aggregate'
 import TrendChart from './components/TrendChart.vue'
@@ -23,8 +23,6 @@ const filters = reactive({ year: '', kind: '', card: '', channel: '', keyword: '
 const keywordInput = ref('')
 const activeMonth = ref('')
 const playing = ref(false)
-// 点击渠道「其他」时冻结的长尾渠道集合（合成项，不是真实 channel）
-const channelOtherMembers = ref([])
 let playTimer = null
 
 /* ---------------- 数据加载 ---------------- */
@@ -54,31 +52,43 @@ watch(keywordInput, (v) => {
 /* ---------------- 筛选 ---------------- */
 const facets = computed(() => facetOptions(rows.value))
 
-// scope：全局筛选（年份/类型/卡号/关键词），下钻不影响它
-const scope = computed(() => {
-  const kw = filters.keyword.toLowerCase()
-  return rows.value.filter((r) => {
-    if (filters.year && r.year !== Number(filters.year)) return false
-    if (filters.kind && r.kind !== filters.kind) return false
-    if (filters.card && r.card !== filters.card) return false
-    if (filters.channel) {
-      const ch = r.channel || '未标注'
-      // 「其他」是长尾合成项：匹配冻结的成员集合，而不是一个不存在的 channel
-      if (filters.channel === '其他') {
-        if (!channelOtherMembers.value.includes(ch)) return false
-      } else if (ch !== filters.channel) return false
-    }
-    if (kw && !(r.merchant.toLowerCase().includes(kw) || r.channel.toLowerCase().includes(kw))) {
-      return false
-    }
-    return true
-  })
+// base：除渠道外的全局筛选（年份/类型/卡号/关键词）。
+// 渠道图从 base 算（crossfilter：维度图不筛自己），选中渠道后图不塌缩，
+// 「其他」的长尾成员也始终等于图上看到的那一组，不会随筛选变陈旧。
+const base = computed(() => applyFilters(rows.value, {
+  year: filters.year, kind: filters.kind, card: filters.card, keyword: filters.keyword
+}))
+
+// otherMembers：当前渠道图「其他」条的真实成员，随 base/下钻实时重算
+const otherMembers = computed(() => {
+  const it = channelItems.value.find((x) => x.name === '其他')
+  return it && it.members ? it.members : []
 })
+
+// scope：base 再叠加渠道筛选；下钻不影响它
+const scope = computed(() => applyFilters(base.value, { channel: filters.channel }, otherMembers.value))
 
 // focused：再叠加下钻月份，除趋势图外都看这一份
 const focused = computed(() =>
   activeMonth.value ? scope.value.filter((r) => r.month === activeMonth.value) : scope.value
 )
+// focusedBase：下钻后的渠道无关基底，只给渠道图用
+const focusedBase = computed(() =>
+  activeMonth.value ? base.value.filter((r) => r.month === activeMonth.value) : base.value
+)
+
+/* ---------------- 图表数据 ----------------
+ * 必须定义在下方两个 watch 之前：Vue 的 watch 创建时会同步求值一次 source，
+ * watch(otherMembers) / immediate watch(stat) 都会走到 channelItems，
+ * 若它还是未初始化的 const，setup 直接抛 TDZ 错误。 */
+const kindItems = computed(() => byKind(focused.value))
+const channelItems = computed(() => byChannel(focusedBase.value, 6))
+const merchantItems = computed(() => byMerchant(focused.value, 9))
+
+// 筛选变化后长尾可能整个消失（渠道 ≤6 个）：自动收起「其他」，避免空视图
+watch(otherMembers, (members) => {
+  if (filters.channel === '其他' && !members.length) filters.channel = ''
+})
 
 const stat = computed(() => summarize(focused.value))
 const months = computed(() => byMonth(scope.value))
@@ -147,7 +157,6 @@ function reset() {
   filters.channel = ''
   filters.keyword = ''
   keywordInput.value = ''
-  channelOtherMembers.value = []
   activeMonth.value = ''
 }
 
@@ -162,25 +171,11 @@ const range = computed(() => {
   return ''
 })
 
-/* ---------------- 图表数据 ---------------- */
-const kindItems = computed(() => byKind(focused.value))
-const channelItems = computed(() => byChannel(focused.value, 6))
-const merchantItems = computed(() => byMerchant(focused.value, 9))
-
-// 渠道点击：真实渠道直接筛选；「其他」先冻结当前长尾成员再筛选，保证非空
+/* ---------------- 渠道交互 ---------------- */
+// 渠道点击：纯切换。真实渠道与合成项「其他」都直接作为筛选值，
+// 「其他」的成员由 otherMembers 实时给出，无需冻结
 function pickChannel(n) {
-  if (filters.channel === n) {
-    filters.channel = ''
-    channelOtherMembers.value = []
-    return
-  }
-  if (n === '其他') {
-    const it = channelItems.value.find((x) => x.name === '其他')
-    channelOtherMembers.value = it && it.members ? it.members : []
-  } else {
-    channelOtherMembers.value = []
-  }
-  filters.channel = n
+  filters.channel = filters.channel === n ? '' : n
 }
 const heat = computed(() => heatGrid(focused.value))
 const hist = computed(() => amountHist(focused.value))

@@ -57,6 +57,33 @@ export function decode(payload) {
 }
 
 /**
+ * 全局筛选（年份/类型/卡号/渠道/关键词）。
+ *
+ * 「其他」是长尾合成项：调用方传入当前渠道图长尾的成员集合 otherMembers，
+ * 命中成员里的真实渠道。成员必须随筛选实时重算（见 App.vue 的 otherMembers），
+ * 冻结一份旧集合会在切年份/类型/下钻月份后筛出偏小甚至空的视图。
+ * 不传 channel 时即「渠道无关基底」，供渠道图自身使用，避免选中后图表自反馈。
+ */
+export function applyFilters(rows, f, otherMembers = []) {
+  const kw = (f.keyword || '').toLowerCase()
+  return rows.filter((r) => {
+    if (f.year && r.year !== Number(f.year)) return false
+    if (f.kind && r.kind !== f.kind) return false
+    if (f.card && r.card !== f.card) return false
+    if (f.channel) {
+      const ch = r.channel || '未标注'
+      if (f.channel === '其他') {
+        if (!otherMembers.includes(ch)) return false
+      } else if (ch !== f.channel) return false
+    }
+    if (kw && !(r.merchant.toLowerCase().includes(kw) || r.channel.toLowerCase().includes(kw))) {
+      return false
+    }
+    return true
+  })
+}
+
+/**
  * 环比/同比：取最近一个「完整月」与上月、去年同月比。
  *
  * 完整月口径与后端 compare_periods 一致：月末日期 ≤ 数据截止日。
@@ -65,6 +92,12 @@ export function decode(payload) {
  * 会把本来完整的月份误判成未走完，KPI 悄悄退到上上个月。
  * 不能要求「月末当天恰好有交易」——月末那天没消费会把整个月误跳过。
  * 当月还没走完时跳过它，否则拿半个月去比整月，环比永远是大跌。
+ *
+ * 启发式的已知边界（有意保留）：截止日取「最后一笔交易」而不是日历今天。
+ * 若最新月份月底没有交易、又没有更晚月份的数据（例如 10-25 之后就没再刷卡），
+ * 这个日历上已走完的月份仍会被判为「未走完」而跳过。这是保守取舍：
+ * trailing 缺口也可能是邮件没同步齐，拿可能缺数的月份下结论更危险。
+ * 用例见 tests/aggregate.test.js「完整月启发式」组。
  */
 export function periodCompare(rows, dataLastDate = '') {
   const netByMonth = new Map()

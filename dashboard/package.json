@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "echarts": "^6.1.0",
