@@ -37,14 +37,19 @@ const usedPct = computed(() => {
   return Math.round(((c[2] || 0) / c[3]) * 1000) / 10
 })
 
-/* 每期取月末最后一个点，画额度使用率；有临时额度的月份（可用 > 固定额度）跳过 */
+/* 每期取月末最后一个点，画额度使用率。
+   临时额度月（可用 > 固定额度）后端已用按 0 计：不再跳过造成空档，
+   而是画成 0 并用琥珀点 + tooltip + 图例解释。 */
 const usage = computed(() => {
   const byMonth = new Map()
-  for (const [dt, avail, used, limit] of props.credit) {
-    if (!limit || avail > limit) continue
-    byMonth.set(dt.slice(0, 7), Math.round((used / limit) * 1000) / 10)
+  for (const row of props.credit) {
+    const [dt, avail, used, limit, tempFlag] = row
+    if (!limit) continue
+    const temp = tempFlag === 1 || tempFlag === true || avail > limit
+    const pct = temp ? 0 : Math.round((used / limit) * 1000) / 10
+    byMonth.set(dt.slice(0, 7), { pct, temp })
   }
-  return [...byMonth.entries()].slice(-36)
+  return [...byMonth.entries()].slice(-36).map(([month, v]) => ({ month, ...v }))
 })
 
 const option = computed(() => ({
@@ -54,11 +59,18 @@ const option = computed(() => ({
     backgroundColor: '#1b2029',
     borderColor: '#262c38',
     textStyle: { color: '#e6e9f0', fontSize: 11 },
-    valueFormatter: (v) => `${v}%`
+    formatter: (ps) => {
+      const p = Array.isArray(ps) ? ps[0] : ps
+      const d = usage.value[p.dataIndex]
+      if (!d) return ''
+      return `<div style="font-size:11px;color:#8b95a7;margin-bottom:2px">${d.month}</div>
+        <div style="font-size:13px;font-weight:600;color:#36cfc9">${d.pct}%</div>` +
+        (d.temp ? '<div style="font-size:10.5px;color:#ffc53d;margin-top:2px">临时额度月 · 已用按 0 计</div>' : '')
+    }
   },
   xAxis: {
     type: 'category',
-    data: usage.value.map((d) => d[0].slice(2)),
+    data: usage.value.map((d) => d.month.slice(2)),
     axisLine: { lineStyle: { color: '#262c38' } },
     axisLabel: { color: '#5d6675', fontSize: 10, interval: Math.max(0, Math.floor(usage.value.length / 8) - 1) },
     axisTick: { show: false }
@@ -73,7 +85,10 @@ const option = computed(() => ({
       type: 'line',
       smooth: true,
       symbol: 'none',
-      data: usage.value.map((d) => d[1]),
+      data: usage.value.map((d) => d.temp
+        ? { value: d.pct, symbol: 'circle', symbolSize: 6,
+            itemStyle: { color: '#ffc53d', borderColor: '#10131a', borderWidth: 1 } }
+        : { value: d.pct }),
       lineStyle: { width: 2, color: '#36cfc9' },
       areaStyle: {
         color: {
@@ -136,7 +151,7 @@ function diffTone(v) {
 
     <div class="bill-body">
       <div class="bill-chart">
-        <div class="cap">额度使用率（按月）</div>
+        <div class="cap">额度使用率（按月）<span class="temp-key"><i></i>临时额度月按 0 计</span></div>
         <BaseChart :option="option" height="188px" />
       </div>
       <div class="bill-table">
@@ -180,6 +195,15 @@ function diffTone(v) {
 .bill-body { display: grid; grid-template-columns: 1.35fr 1fr; gap: 14px; }
 .bill-chart, .bill-table { min-width: 0; }
 .cap { font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+.temp-key { margin-left: 10px; color: var(--dim); font-size: 10.5px; }
+.temp-key i {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #ffc53d;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
 table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
 th {
   text-align: right;

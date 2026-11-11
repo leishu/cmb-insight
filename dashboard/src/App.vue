@@ -23,6 +23,8 @@ const filters = reactive({ year: '', kind: '', card: '', channel: '', keyword: '
 const keywordInput = ref('')
 const activeMonth = ref('')
 const playing = ref(false)
+// 点击渠道「其他」时冻结的长尾渠道集合（合成项，不是真实 channel）
+const channelOtherMembers = ref([])
 let playTimer = null
 
 /* ---------------- 数据加载 ---------------- */
@@ -59,7 +61,13 @@ const scope = computed(() => {
     if (filters.year && r.year !== Number(filters.year)) return false
     if (filters.kind && r.kind !== filters.kind) return false
     if (filters.card && r.card !== filters.card) return false
-    if (filters.channel && (r.channel || '未标注') !== filters.channel) return false
+    if (filters.channel) {
+      const ch = r.channel || '未标注'
+      // 「其他」是长尾合成项：匹配冻结的成员集合，而不是一个不存在的 channel
+      if (filters.channel === '其他') {
+        if (!channelOtherMembers.value.includes(ch)) return false
+      } else if (ch !== filters.channel) return false
+    }
     if (kw && !(r.merchant.toLowerCase().includes(kw) || r.channel.toLowerCase().includes(kw))) {
       return false
     }
@@ -139,6 +147,7 @@ function reset() {
   filters.channel = ''
   filters.keyword = ''
   keywordInput.value = ''
+  channelOtherMembers.value = []
   activeMonth.value = ''
 }
 
@@ -157,6 +166,22 @@ const range = computed(() => {
 const kindItems = computed(() => byKind(focused.value))
 const channelItems = computed(() => byChannel(focused.value, 6))
 const merchantItems = computed(() => byMerchant(focused.value, 9))
+
+// 渠道点击：真实渠道直接筛选；「其他」先冻结当前长尾成员再筛选，保证非空
+function pickChannel(n) {
+  if (filters.channel === n) {
+    filters.channel = ''
+    channelOtherMembers.value = []
+    return
+  }
+  if (n === '其他') {
+    const it = channelItems.value.find((x) => x.name === '其他')
+    channelOtherMembers.value = it && it.members ? it.members : []
+  } else {
+    channelOtherMembers.value = []
+  }
+  filters.channel = n
+}
 const heat = computed(() => heatGrid(focused.value))
 const hist = computed(() => amountHist(focused.value))
 const tableRows = computed(() => [...focused.value].reverse())
@@ -260,12 +285,12 @@ const peakHour = computed(() => {
         </div>
       </div>
       <div class="kpi k2">
-        <div class="label"><span>交易笔数</span><span>均 {{ fmtMoney(stat.perMonth, 0) }}/月</span></div>
+        <div class="label"><span>交易笔数</span><span>均 {{ fmtMoney(stat.perMonthCount, 0) }} 笔/月</span></div>
         <div class="value">{{ fmtMoney(Math.round(anim.count)) }}<span class="unit">笔</span></div>
         <div class="sub">覆盖 <b>{{ stat.months }}</b> 个月 · 单笔最高 <b>¥{{ fmtShort(stat.max) }}</b></div>
       </div>
       <div class="kpi k3">
-        <div class="label"><span>笔均金额</span><span>中位区间 50-100</span></div>
+        <div class="label"><span>笔均金额</span><span>中位区间 {{ stat.medianBucket }}</span></div>
         <div class="value">¥{{ fmtMoney(anim.avg, 1) }}</div>
         <div class="sub">高频时段 <b>{{ String(peakHour[0]).padStart(2, '0') }}:00</b>（{{ peakHour[1] }} 笔）</div>
       </div>
@@ -326,7 +351,7 @@ const peakHour = computed(() => {
           color="#36cfc9"
           :label-width="86"
           :active="filters.channel || ''"
-          @pick="(n) => (filters.channel = filters.channel === n ? '' : n)"
+          @pick="pickChannel"
         />
       </div>
 

@@ -39,7 +39,7 @@ const page = computed(() => props.rows.slice(0, shown.value))
           </td>
           <td style="color: #5d6675">{{ r.card || '—' }}</td>
           <td :class="r.sign === -1 ? 'in' : 'out'">
-            {{ r.sign === -1 ? '+' : '' }}{{ fmtMoney(r.signed, 2) }}
+            {{ r.sign === -1 ? '+' : '' }}{{ fmtMoney(Math.abs(r.signed), 2) }}
           </td>
         </tr>
         <tr v-if="!page.length">

@@ -1429,8 +1429,9 @@ def dashboard_payload(conn: sqlite3.Connection) -> dict:
         # [月, 到期日, 应还, 最低, 本期消费, 利息, 对账差额]
         "bills": [[r["bill_month"], r["due_date"], r["due_amount"], r["min_amount"],
                    r["debits"], r["interest"], rec.get(r["bill_month"])] for r in bill_rows],
-        # [日期, 可用额度, 已用额度, 额度上限]
-        "credit": [[u["dt"], u["avail"], u["used"], u["limit"]] for u in usage],
+        # [日期, 可用额度, 已用额度, 额度上限, 临时额度月(0/1)]
+        "credit": [[u["dt"], u["avail"], u["used"], u["limit"],
+                    1 if u.get("temp_limit") else 0] for u in usage],
     }
 
 

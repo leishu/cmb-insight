@@ -221,6 +221,17 @@ html, body {
 /* ---------- 表格 ---------- */
 .table-wrap { overflow: auto; max-height: 420px; margin-top: 6px; }
 
+/* 滚动条用面板自己的色系，而不是浏览器默认灰 */
+.table-wrap { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.table-wrap::-webkit-scrollbar-track { background: transparent; }
+.table-wrap::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 4px;
+  border: 2px solid var(--panel);
+}
+.table-wrap::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
 table.tx {
   width: 100%;
   border-collapse: collapse;

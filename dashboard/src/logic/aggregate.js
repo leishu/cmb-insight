@@ -118,6 +118,7 @@ export function summarize(rows) {
   let refunds = 0
   const merchants = new Set()
   const months = new Set()
+  const amounts = []
   for (const r of rows) {
     net += r.signed
     gross += r.amount
@@ -126,7 +127,16 @@ export function summarize(rows) {
     if (r.sign === -1) refunds++
     if (r.merchant) merchants.add(r.merchant)
     if (r.month) months.add(r.month)
+    amounts.push(r.amount)
   }
+  // 中位金额所在区间：随筛选实时变化，不再写死
+  amounts.sort((a, b) => a - b)
+  let median = 0
+  if (amounts.length) {
+    const mid = Math.floor(amounts.length / 2)
+    median = amounts.length % 2 ? amounts[mid] : (amounts[mid - 1] + amounts[mid]) / 2
+  }
+  const bucket = BUCKETS.find(([lo, hi]) => median >= lo && median < hi) || BUCKETS[BUCKETS.length - 1]
   return {
     count,
     net,
@@ -136,7 +146,11 @@ export function summarize(rows) {
     avg: count ? gross / count : 0,
     merchants: merchants.size,
     months: months.size,
-    perMonth: months.size ? net / months.size : 0
+    perMonth: months.size ? net / months.size : 0,
+    // 笔数/月（交易笔数卡用），区别于 perMonth 的金额/月
+    perMonthCount: months.size ? count / months.size : 0,
+    median,
+    medianBucket: bucket[2]
   }
 }
 
@@ -171,6 +185,8 @@ export function byChannel(rows, limit = 7) {
   const tail = list.slice(limit)
   head.push({
     name: '其他',
+    // 记录长尾成员，点击「其他」时据此筛选真实渠道，而不是匹配一个不存在的 channel
+    members: tail.map((x) => x.name),
     tx_count: tail.reduce((s, x) => s + x.tx_count, 0),
     net: tail.reduce((s, x) => s + x.net, 0),
     gross: tail.reduce((s, x) => s + x.gross, 0)
