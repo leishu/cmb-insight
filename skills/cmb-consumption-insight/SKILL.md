@@ -1,7 +1,7 @@
 ---
 name: cmb-consumption-insight
 description: "招商银行信用卡消费分析。当用户问招行信用卡花了多少钱、某月/某年支出多少、钱花在哪些商户、什么时候刷卡最多、找某笔消费、要消费图表，或者要写 SQL 查账单时使用。关键词：招行、招商银行、信用卡账单、消费分析、支出统计、商户排行、账单面板、sqlite 查账单。"
-version: 0.5.0
+version: 0.3.0
 author: leishu
 ---
 

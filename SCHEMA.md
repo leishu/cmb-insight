@@ -75,7 +75,7 @@
 | `subject` | TEXT | 邮件主题 | 分类判定的依据（见下） |
 | `mail_time` | TEXT | 邮件发出时间 `YYYY-MM-DD HH:MM:SS` | 优先取文件名前缀，失败退回 `Date` 头 |
 | `mail_date` | TEXT **生成列** | `substr(mail_time,1,10)` | 只读，别写 |
-| `category` | TEXT | 邮件类型，见下方枚举 | 由主题关键词判定，5 类 |
+| `category` | TEXT | 邮件类型，见下方枚举 | 由主题关键词判定，6 类（含「解析失败」） |
 | `size_bytes` | INTEGER | 文件字节数 | 与 `file_hash` 一起判断「内容变了」→ 删旧重插 |
 | `file_hash` | TEXT | 文件内容 sha1 | v6 新增；同尺寸的内容变更也能检测到。解析失败行为空串 |
 | `tx_count` | INTEGER | 这封邮件解析出的交易行数（**`tx` + `tx_fx`**） | **不含 `hold`**；账单/还款类是 0，正常 |
@@ -83,7 +83,7 @@
 | `body_text` | TEXT | 正文纯文本（上限 20,000 字符） | HTML 去标签；供全文检索与人工核对 |
 | `imported_at` | TEXT | 入库时间 | 默认 `datetime('now','localtime')` |
 
-**`category` 的 5 个取值**（`cmb_parse.py:477`，按主题关键词顺序匹配）：
+**`category` 的 6 个取值**（前 5 类在 `cmb_parse.py:501` 按主题关键词顺序匹配；`解析失败` 由 db 层落库）：
 
 | 值 | 判定 | 相对量 | 有交易明细吗 |
 |---|---|---|---|
@@ -131,8 +131,8 @@
 | `A` | 固定列位：日期 / 时间 / 币种 / 描述 / 金额 | 信用管家消费提醒（2017–2020 老版） |
 
 **`tx_date` 的日期口径**：消费提醒里是**交易时间**，电子账单明细里是**记账日**。同一笔可能差 1 天。
-做「按月对齐账单」时不要指望两边逐笔相等，正确做法是对月度汇总（现有 `coverage()` 的账单侧核对
-就是这么做的，差 <1%）。
+做「按月对齐账单」时不要指望两边逐笔相等，正确做法是对汇总（现有 `bills()` 的逐期
+`reconcile_diff` 就是这么做的：账单周期内的 `debits − credits` 比同期提醒流净额）。
 
 **不要直接写这张表**：`month` / `year` / `dow` / `hour` / `signed_amount` 是 STORED 生成列，
 手写会报错。要改数据就改 `.eml` 然后重建。
@@ -212,7 +212,7 @@
 | `interest` | REAL | 本期利息 | 仅新版式有，且**实测全为 0.0**（不是「没利息数据」，是那几期确实为 0） |
 | `layout` | TEXT | `id`（新版式）/ `pos`（老版式） | 见下 |
 
-**两种版式**（`cmb_parse.py:121`）：
+**两种版式**（`cmb_parse.py:129`）：
 
 | `layout` | 年代 | 抽取方式 | 能拿到什么 |
 |---|---|---|---|
@@ -220,8 +220,8 @@
 | `pos` | 早年老版式 | 只有「到期还款日 ￥应还 ＄应还 ￥最低 ＄最低」四个连续单元格，按位置取 | 只有 `due_date` / `due_amount` / `min_amount` |
 
 **关键区分**：`bill.due_amount` ≠ 当月消费额。想算「这个月花了多少」查 `tx`；想算「这期要还多少」查
-`bill`。两者差额来自上期余额、还款、退款、费用，属正常。`coverage()` 的账单侧核对就是拿
-`bill.debits - bill.credits` 和 `tx` 月度汇总比的。
+`bill`。两者差额来自上期余额、还款、退款、费用，属正常。`bills()` 的 `reconcile_diff` 就是拿
+`bill.debits - bill.credits` 和账单周期内 `tx` 汇总比的。
 
 ---
 
@@ -263,7 +263,7 @@
 | `hold_count` | 预授权行数 | 整数 |
 | `bill_count` | 账单期数 | 整数 |
 | `credit_count` | 额度快照数 | 整数 |
-| `schema_version` | 结构版本 | `4` |
+| `schema_version` | 结构版本 | `6` |
 
 > 这些计数是**上次导入时的快照**，不是实时值。要实时数字就 `SELECT COUNT(*)`；两者不一致说明库被
 > 手工改过或导入中断。`schema_version < SCHEMA_VERSION` 时，下次导入会自动全量重建。

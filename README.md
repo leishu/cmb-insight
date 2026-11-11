@@ -29,7 +29,7 @@
 |---|---|---|
 | WorkBuddy | ≥ 5.6 | 需要插件市场与 MCP App（`ui://` 资源） |
 | Python | ≥ 3.9，且 SQLite 带 FTS5 + trigram | 中文子串检索靠 trigram；`install.sh` 会自检 |
-| Node | ≥ 18，**可选** | 只在改前端时需要，`dashboard/dist/index.html` 已随仓库提供 |
+| Node | ^20.19.0 \|\| >=22.12.0（Vite 7 要求），**可选** | 只在改前端时需要，`dashboard/dist/index.html` 已随仓库提供 |
 
 一条命令验 Python 和 SQLite：
 
@@ -100,7 +100,7 @@ cp mcp.json mcp.json.bak-$(date +%Y%m%d)
     {
       "name": "cmb-insight",
       "source": "./cmb-insight",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "招商银行信用卡邮件洞察：SQLite 入库、只读 SQL 查询、Vue3 + ECharts 可交互面板（MCP App）。"
     }
   ]
@@ -136,7 +136,7 @@ cp mcp.json mcp.json.bak-$(date +%Y%m%d)
   {
     "scope": "user",
     "installPath": "/path/to/cmb-market/cmb-insight",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "installedAt": "2026-11-10T06:04:24.000Z",
     "lastUpdated": "2026-11-10T06:04:24.000Z"
   }
@@ -415,7 +415,7 @@ json.dump(p, open('dashboard/data.dev.json','w',encoding='utf-8'), ensure_ascii=
 cd dashboard && npm run build
 ```
 
-产物是**单个** `dist/index.html`（约 796 KB，gzip 275 KB）。因为 MCP App 的 `ui://` 资源只能返回一段 `text/html`，不能引用外部 js/css，所以用 `vite-plugin-singlefile` 把 Vue 运行时、ECharts 和样式全部内联。
+产物是**单个** `dist/index.html`（约 805 KB，gzip 约 276 KB）。因为 MCP App 的 `ui://` 资源只能返回一段 `text/html`，不能引用外部 js/css，所以用 `vite-plugin-singlefile` 把 Vue 运行时、ECharts 和样式全部内联。
 
 ### 数据注入
 
@@ -425,9 +425,9 @@ cd dashboard && npm run build
 <script id="cmb-data" type="text/plain">__CMB_DATA_B64__</script>
 ```
 
-`server.render_dashboard()` 读取该文件，把 `db.dashboard_payload()` 的结果 JSON → gzip → base64 后替换进去。前端用 `DecompressionStream` 解压。近万笔交易压缩后约 200 KB，整页约 1 MB。
+`server.render_dashboard()` 读取该文件，把 `db.dashboard_payload()` 的结果 JSON → gzip → base64 后替换进去。前端用 `DecompressionStream` 解压。近万笔交易压缩后约 120 KB，整页约 1 MB。
 
-> 之所以不选明文 JSON：明文要 800 KB，gzip 后 200 KB，差值就是加载速度。
+> 之所以不选明文 JSON：明文要 870 KB，gzip 后 120 KB，差值就是加载速度。
 
 ### 面板功能
 

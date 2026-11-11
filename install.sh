@@ -9,7 +9,7 @@
 #   cd ~/cmb-market/cmb-insight && ./install.sh
 #   ./install.sh --dry-run     # 只看会改什么，不落盘
 #
-# 会改动 4 个位置（都先备份 .bak-<时间戳>）：
+# 会改动 5 个位置（都先备份 .bak-<时间戳>）：
 #   <市场目录>/.codebuddy-plugin/marketplace.json      市场清单
 #   ~/.workbuddy/plugins/known_marketplaces.json       登记市场
 #   ~/.workbuddy/plugins/installed_plugins.json        登记安装
