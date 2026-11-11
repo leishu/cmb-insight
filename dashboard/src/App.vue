@@ -74,8 +74,12 @@ const focused = computed(() =>
 
 const stat = computed(() => summarize(focused.value))
 const months = computed(() => byMonth(scope.value))
+// 数据全局截止日：完整月判断不能跟着筛选走，
+// 否则筛「退款」会把最后退款日当截止日，把完整的月份误判成未走完
+const dataLastDate = computed(() =>
+  rows.value.reduce((last, r) => (r.date > last ? r.date : last), ''))
 // 环比/同比跟着筛选走：只看某一年时，就是那一年的月度变化
-const cmp = computed(() => periodCompare(scope.value))
+const cmp = computed(() => periodCompare(scope.value, dataLastDate.value))
 const pctText = (v) => (v === null || v === undefined ? '—' : `${v > 0 ? '+' : ''}${v}%`)
 
 /* ---------------- KPI 数字滚动 ---------------- */

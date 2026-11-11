@@ -59,17 +59,20 @@ export function decode(payload) {
 /**
  * 环比/同比：取最近一个「完整月」与上月、去年同月比。
  *
- * 完整月口径与后端 compare_periods 一致：月末日期 ≤ 数据里最后一笔交易日期。
+ * 完整月口径与后端 compare_periods 一致：月末日期 ≤ 数据截止日。
+ * 截止日必须传全局最后一笔交易日期（dataLastDate），不能从传入 rows 里推：
+ * rows 是筛选后的子集，筛「退款」时最后退款日可能停在月中，
+ * 会把本来完整的月份误判成未走完，KPI 悄悄退到上上个月。
  * 不能要求「月末当天恰好有交易」——月末那天没消费会把整个月误跳过。
  * 当月还没走完时跳过它，否则拿半个月去比整月，环比永远是大跌。
  */
-export function periodCompare(rows) {
+export function periodCompare(rows, dataLastDate = '') {
   const netByMonth = new Map()
-  let lastTx = ''
+  let lastTx = dataLastDate || ''
   for (const r of rows) {
     if (!r.month) continue
     netByMonth.set(r.month, (netByMonth.get(r.month) || 0) + r.signed)
-    if (r.date > lastTx) lastTx = r.date
+    if (!dataLastDate && r.date > lastTx) lastTx = r.date
   }
   const months = [...netByMonth.keys()].sort()
   if (months.length < 2) return null

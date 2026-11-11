@@ -932,6 +932,22 @@ def aggregate(conn: sqlite3.Connection, dimension: str = "month", since=None,
     return [dict(r) for r in conn.execute(sql, params)]
 
 
+def aggregate_totals(conn: sqlite3.Connection, since=None, until=None, kind=None,
+                     channel=None, card=None, keyword=None) -> dict:
+    """筛选后的全量合计，不受分组 LIMIT 截断影响。
+
+    aggregate 的分组列表会被 limit 截断，拿返回行求和当总量会系统性偏小；
+    表头口径（共 N 笔 / 净支出 X）必须单独按同一套过滤条件全量统计。
+    """
+    where, params = _filters(since, until, kind, channel, card, keyword)
+    r = conn.execute(
+        f"""SELECT COUNT(*) AS tx_count,
+                   ROUND(COALESCE(SUM(t.signed_amount), 0), 2) AS net_amount,
+                   ROUND(COALESCE(SUM(t.amount), 0), 2) AS gross_amount
+            FROM tx t WHERE {where}""", params).fetchone()
+    return {"count": r["tx_count"], "net": r["net_amount"], "gross": r["gross_amount"]}
+
+
 # --------------------------------------------------------------------------- #
 # 环比 / 同比
 # --------------------------------------------------------------------------- #
@@ -1290,68 +1306,93 @@ def top_merchants(conn: sqlite3.Connection, limit: int = 10, since=None,
     return [dict(r) for r in rows]
 
 
+def _search_clauses(conn: sqlite3.Connection, keyword: str | None, since, until,
+                    min_amount, max_amount, kind) -> tuple:
+    """构造人民币/外币检索的 WHERE 与参数，明细与全量合计共用。
+
+    FTS 与 LIKE 的取舍在这里一次性决定（FTS 命中为空才退 LIKE），
+    保证 search_transactions 与 search_summary 两边口径完全一致。
+    """
+    base_where, base_params = _filters(since, until, kind)
+    kw = (keyword or "").strip()
+    extra_where, extra_params = "", []
+    if min_amount is not None:
+        extra_where += " AND t.amount >= ?"
+        extra_params.append(min_amount)
+    if max_amount is not None:
+        extra_where += " AND t.amount <= ?"
+        extra_params.append(max_amount)
+    like_kw = " AND (t.merchant LIKE ? OR t.channel LIKE ?)"
+    like_params = [f"%{kw}%"] * 2
+
+    # 外币行少（几十笔），不进 FTS，直接 LIKE；金额过滤按原币数值
+    fx_where = base_where + (like_kw if kw else "") + extra_where
+    fx_params = base_params + (like_params if kw else []) + extra_params
+
+    cny_where, cny_params = base_where + extra_where, base_params + extra_params
+    if kw:
+        # trigram 分词对 <3 字符的串不建索引，直接走 LIKE；
+        # >=3 字符优先走 FTS，命中为空时再退一次 LIKE（索引漂移、全角差异都可能漏）
+        use_fts = False
+        if len(kw) >= 3:
+            fts_where = (base_where
+                         + " AND t.id IN (SELECT rowid FROM tx_fts WHERE tx_fts MATCH ?)"
+                         + extra_where)
+            fts_params = base_params + ['"' + kw.replace('"', '""') + '"'] + extra_params
+            use_fts = conn.execute(
+                f"SELECT 1 FROM tx t WHERE {fts_where} LIMIT 1",
+                fts_params).fetchone() is not None
+        if use_fts:
+            cny_where, cny_params = fts_where, fts_params
+        else:
+            cny_where = base_where + like_kw + extra_where
+            cny_params = base_params + like_params + extra_params
+    return cny_where, cny_params, fx_where, fx_params
+
+
 def search_transactions(conn: sqlite3.Connection, keyword: str | None = None,
                         since=None, until=None, min_amount=None, max_amount=None,
                         kind=None, limit: int = 20) -> list[dict]:
-    base_where, base_params = _filters(since, until, kind)
-    kw = (keyword or "").strip()
+    cny_where, cny_params, fx_where, fx_params = _search_clauses(
+        conn, keyword, since, until, min_amount, max_amount, kind)
+    rows = [dict(r) for r in conn.execute(f"""
+        SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind, t.state,
+               t.amount, t.sign, t.card, 'CNY' AS currency, m.category AS mail_category
+        FROM tx t JOIN mail m ON m.id = t.mail_id
+        WHERE {cny_where}
+        ORDER BY t.tx_date DESC, t.tx_time DESC
+        LIMIT ?""", [*cny_params, limit])]
+    rows += [dict(r) for r in conn.execute(f"""
+        SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind, t.state,
+               t.amount, t.sign, t.card, t.currency, m.category AS mail_category
+        FROM tx_fx t JOIN mail m ON m.id = t.mail_id
+        WHERE {fx_where}
+        ORDER BY t.tx_date DESC, t.tx_time DESC
+        LIMIT ?""", [*fx_params, limit])]
+    rows.sort(key=lambda r: (r["tx_date"], r["tx_time"]), reverse=True)
+    return rows[:limit]
 
-    def extra_filters():
-        where, params = "", []
-        if min_amount is not None:
-            where += " AND t.amount >= ?"
-            params.append(min_amount)
-        if max_amount is not None:
-            where += " AND t.amount <= ?"
-            params.append(max_amount)
-        return where, params
 
-    def run(use_fts: bool) -> list[dict]:
-        where, params = base_where, list(base_params)
-        if kw:
-            if use_fts:
-                where += (" AND t.id IN (SELECT rowid FROM tx_fts WHERE tx_fts MATCH ?)")
-                params.append('"' + kw.replace('"', '""') + '"')
-            else:
-                where += " AND (t.merchant LIKE ? OR t.channel LIKE ?)"
-                params.extend([f"%{kw}%"] * 2)
-        ew, ep = extra_filters()
-        where += ew
-        params.extend(ep)
-        return [dict(r) for r in conn.execute(f"""
-            SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind, t.state,
-                   t.amount, t.sign, t.card, 'CNY' AS currency, m.category AS mail_category
-            FROM tx t JOIN mail m ON m.id = t.mail_id
-            WHERE {where}
-            ORDER BY t.tx_date DESC, t.tx_time DESC
-            LIMIT ?""", [*params, limit])]
+def search_summary(conn: sqlite3.Connection, keyword: str | None = None,
+                   since=None, until=None, min_amount=None, max_amount=None,
+                   kind=None) -> dict:
+    """全量命中口径：笔数与净额不受明细 limit 截断影响。
 
-    def run_fx() -> list[dict]:
-        # 外币行少（几十笔），不进 FTS，直接 LIKE；金额过滤按原币数值
-        where, params = base_where, list(base_params)
-        if kw:
-            where += " AND (t.merchant LIKE ? OR t.channel LIKE ?)"
-            params.extend([f"%{kw}%"] * 2)
-        ew, ep = extra_filters()
-        where += ew
-        params.extend(ep)
-        return [dict(r) for r in conn.execute(f"""
-            SELECT t.tx_date, t.tx_time, t.merchant, t.channel, t.kind, t.state,
-                   t.amount, t.sign, t.card, t.currency, m.category AS mail_category
-            FROM tx_fx t JOIN mail m ON m.id = t.mail_id
-            WHERE {where}
-            ORDER BY t.tx_date DESC, t.tx_time DESC
-            LIMIT ?""", [*params, limit])]
-
-    # trigram 分词对 <3 字符的串不建索引，直接走 LIKE；
-    # >=3 字符优先走 FTS，命中为空时再退一次 LIKE（索引漂移、全角差异都可能漏）
-    if kw and len(kw) >= 3:
-        rows = run(True) or run(False)
-    else:
-        rows = run(False)
-    merged = rows + run_fx()
-    merged.sort(key=lambda r: (r["tx_date"], r["tx_time"]), reverse=True)
-    return merged[:limit]
+    「命中 N 笔、合计 X 元」如果拿截断后的明细求和，会把前 30 条当成全部，
+    这里按与 search_transactions 相同的谓词对全表统计。
+    """
+    cny_where, cny_params, fx_where, fx_params = _search_clauses(
+        conn, keyword, since, until, min_amount, max_amount, kind)
+    r = conn.execute(
+        f"""SELECT COUNT(*) AS n, ROUND(COALESCE(SUM(t.signed_amount), 0), 2) AS net
+            FROM tx t WHERE {cny_where}""", cny_params).fetchone()
+    fx = [{"currency": row["currency"], "count": row["n"], "net_amount": row["net"]}
+          for row in conn.execute(
+              f"""SELECT t.currency, COUNT(*) AS n, ROUND(SUM(t.signed_amount), 2) AS net
+                  FROM tx_fx t WHERE {fx_where}
+                  GROUP BY t.currency ORDER BY t.currency""", fx_params)]
+    return {"matched": r["n"] + sum(f["count"] for f in fx),
+            "cny_count": r["n"], "net_spend": r["net"], "foreign": fx}
 
 
 def monthly(conn: sqlite3.Connection) -> list[dict]:

@@ -70,7 +70,7 @@ meta   (key, value)   -- schema_version / *_count（含 tx_fx_count）/ last_syn
 
 **预授权不在 `tx` 里**：占用额度的那笔在 `hold`，真正入账的「预授权完成」在 `tx` 且 `state='预授权完成'`、`kind='消费'`。算支出只用 `tx`，问「占用多少额度」才看 `hold`。
 
-**`aggregate` 的返回与归一**：每行是 `name` / `tx_count` / `net_amount`（消费−退款）/ `gross_amount`（不冲减退款）。空值会被归一成标签——`kind` 空→`未分类`、`channel` 空→`未标注`、`card` 空→该行直接被过滤掉（不返回空名分组）。`amount_bucket` 固定 9 档（≤10 / 10-30 / 30-50 / 50-100 / 100-200 / 200-500 / 500-1k / 1k-3k / >3k），与面板一致。只有 `month`/`year`/`hour` 按名称升序，`amount_bucket` 按金额下限升序，其余按 `net_amount` 降序。
+**`aggregate` 的返回与归一**：每行是 `name` / `tx_count` / `net_amount`（消费−退款）/ `gross_amount`（不冲减退款）。空值会被归一成标签——`kind` 空→`未分类`、`channel` 空→`未标注`、`card` 空→该行直接被过滤掉（不返回空名分组）。`amount_bucket` 固定 9 档（≤10 / 10-30 / 30-50 / 50-100 / 100-200 / 200-500 / 500-1k / 1k-3k / >3k），与面板一致。只有 `month`/`year`/`hour` 按名称升序，`amount_bucket` 按金额下限升序，其余按 `net_amount` 降序。**表头 `total`/`net_spend` 是筛选后的全量合计，不受 `limit` 截断影响**；`items` 只是前 `limit` 个分组（`truncated=true` 时还有更多），报总量用表头、不要对 `items` 求和。
 
 ## 什么时候用 run_sql
 
@@ -109,7 +109,7 @@ SELECT year, merchant, total FROM (
    回答趋势类问题时若用户问到的月份在名单里，要主动说明「该月邮件可能缺失」。
 9. **外币原币单列，不进人民币总额**：邮件里没有人民币折算金额，HKD 等交易存 `tx_fx`。
    `get_overview` 的 `foreign_currency` 按币种单报；`aggregate`/`top_merchants`/面板只统计 `tx`（CNY）。
-   `search_transactions` 会同时搜两张表，每条带 `currency`，外币净额在 `foreign_net` 里单列。
+   `search_transactions` 会同时搜两张表，每条带 `currency`，外币净额在 `foreign_net` 里单列。`matched`/`net_spend`/`foreign_net` 是全部命中的合计口径，`items` 只是前 `limit` 条明细（`truncated=true` 时还有更多），报总额用合计字段、不要对 `items` 求和。
 10. **2017–2019 的额度是反推值**：老版式模板的标签是图片，额度由「已用 + 可用」相加得出，
    取不到时宁可为空；与账单 `credit_limit` 不一致时以邮件自带值为准。
 

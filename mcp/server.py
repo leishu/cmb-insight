@@ -146,15 +146,20 @@ def tool_bills(limit: int = 12, since=None) -> dict:
 
 def tool_aggregate(dimension: str, since=None, until=None, kind=None,
                    card=None, merchant=None, limit=200) -> dict:
-    rows = _rows(db.aggregate(conn(), dimension, since, until, kind=kind, card=card,
-                              keyword=merchant, limit=limit))
+    c = conn()
+    # 表头合计走全量口径：分组列表带 LIMIT，拿返回行求和会把截断当总量
+    totals = db.aggregate_totals(c, since, until, kind=kind, card=card, keyword=merchant)
+    rows = _rows(db.aggregate(c, dimension, since, until, kind=kind, card=card,
+                              keyword=merchant))
     if dimension == "weekday":
         order = {w: i for i, w in enumerate(WEEK_ORDER)}
         rows.sort(key=lambda x: order.get(x["label"], 99))
-    total = sum(r["count"] for r in rows)
-    net = round(sum(r["amount"] for r in rows), 2)
-    return {"dimension": dimension, "total": total, "net_spend": net,
-            "items": rows[: max(1, min(limit, 200))]}
+    items = rows[: max(1, min(limit, 200))]
+    return {"dimension": dimension, "total": totals["count"], "net_spend": totals["net"],
+            "group_count": len(rows), "truncated": len(rows) > len(items),
+            # 维度为空的交易不进分组（如 card 空），全量合计与分组之和的差在这里交代
+            "unlabeled_count": totals["count"] - sum(r["count"] for r in rows),
+            "items": items}
 
 
 def tool_compare(granularity="month", current=None, compare="mom", by=None,
@@ -173,22 +178,22 @@ def tool_subscriptions(since=None, until=None, cadence=None, min_coverage=0.7,
 
 def tool_search(keyword=None, since=None, until=None, kind=None,
                 min_amount=None, max_amount=None, limit=30) -> dict:
-    rows = db.search_transactions(conn(), keyword, since, until, min_amount,
+    c = conn()
+    rows = db.search_transactions(c, keyword, since, until, min_amount,
                                   max_amount, kind, limit)
+    # 命中数与合计走全量口径：明细被 limit 截断，不能拿返回行当总数
+    summary = db.search_summary(c, keyword, since, until, min_amount, max_amount, kind)
     items = [{"date": r["tx_date"], "time": r["tx_time"], "amount": r["amount"],
               "sign": r["sign"], "kind": r["kind"], "channel": r["channel"],
               "merchant": r["merchant"], "card": r["card"],
               "currency": r.get("currency") or "CNY",
               "mail_category": r["mail_category"]} for r in rows]
-    # 不同币种不能相加：net_spend 只算 CNY，外币按币种单列
-    fx: dict[str, float] = {}
-    for i in items:
-        if i["currency"] != "CNY":
-            fx[i["currency"]] = round(fx.get(i["currency"], 0.0) + i["amount"] * i["sign"], 2)
-    return {"matched": len(items),
-            "net_spend": round(sum(i["amount"] * i["sign"] for i in items
-                                   if i["currency"] == "CNY"), 2),
-            "foreign_net": fx,
+    # 不同币种不能相加：net_spend 只算 CNY，外币按币种单列（均为全量命中口径）
+    return {"matched": summary["matched"],
+            "returned": len(items),
+            "truncated": summary["matched"] > len(items),
+            "net_spend": summary["net_spend"],
+            "foreign_net": {f["currency"]: f["net_amount"] for f in summary["foreign"]},
             "items": items}
 
 
@@ -281,7 +286,7 @@ TOOLS = [
     },
     {
         "name": "aggregate",
-        "description": "按单一维度聚合交易。dimension 可选 year/month/weekday/hour/kind/channel/merchant/card/amount_bucket。返回每项笔数与净金额（消费-退款）。用于月度趋势、渠道占比、金额分布等。",
+        "description": "按单一维度聚合交易。dimension 可选 year/month/weekday/hour/kind/channel/merchant/card/amount_bucket。返回每项笔数与净金额（消费-退款）。用于月度趋势、渠道占比、金额分布等。total/net_spend 是筛选后的全量合计，不受 limit 影响；items 最多返回 limit 个分组，truncated=true 表示分组有截断。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -348,7 +353,7 @@ TOOLS = [
     },
     {
         "name": "search_transactions",
-        "description": "按关键词/时间/金额检索单笔交易明细。关键词走 FTS5 全文索引（≥3 字走 trigram 子串匹配，2 字走 LIKE），匹配商户、渠道与邮件主题。",
+        "description": "按关键词/时间/金额检索单笔交易明细。关键词走 FTS5 全文索引（≥3 字走 trigram 子串匹配，2 字走 LIKE），匹配商户、渠道与邮件主题。matched/net_spend/foreign_net 为全部命中的合计口径；items 最多返回 limit 条明细（truncated=true 表示有截断），报总额时直接用合计字段，不要对 items 求和。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -469,6 +474,11 @@ def call_tool(name: str, args: dict) -> dict:
                               args.get("merchant"), int(args.get("limit", 200)))
         lines = [f"{i['label']}\t{i['count']} 笔\t{i['amount']:,.2f} 元" for i in data["items"]]
         head = f"{data['dimension']} 聚合，共 {data['total']} 笔，净支出 {data['net_spend']:,.2f} 元"
+        if data.get("truncated"):
+            head += (f"（共 {data['group_count']} 个分组，仅列出前 {len(data['items'])} 个；"
+                     f"笔数与净支出为全量合计，不受显示截断影响）")
+        if data.get("unlabeled_count"):
+            head += f"（另有 {data['unlabeled_count']} 笔该维度为空，未列入分组）"
         return {"content": [{"type": "text", "text": head + "\n" + "\n".join(lines)}],
                 "structuredContent": data}
     if name == "top_merchants":
@@ -527,6 +537,8 @@ def call_tool(name: str, args: dict) -> dict:
         head = f"命中 {data['matched']} 笔，人民币合计 {data['net_spend']:,.2f} 元"
         if data.get("foreign_net"):
             head += "；外币 " + "、".join(f"{v:,.2f} {k}" for k, v in data["foreign_net"].items())
+        if data.get("truncated"):
+            head += f"（笔数与金额为全部命中口径，以下仅列出最近 {data['returned']} 笔）"
         return {"content": [{"type": "text", "text": head + "\n" + "\n".join(lines)}],
                 "structuredContent": data}
     if name == "run_sql":
