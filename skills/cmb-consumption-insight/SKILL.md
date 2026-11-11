@@ -1,7 +1,7 @@
 ---
 name: cmb-consumption-insight
 description: "招商银行信用卡消费分析。当用户问招行信用卡花了多少钱、某月/某年支出多少、钱花在哪些商户、什么时候刷卡最多、找某笔消费、要消费图表，或者要写 SQL 查账单时使用。关键词：招行、招商银行、信用卡账单、消费分析、支出统计、商户排行、账单面板、sqlite 查账单。"
-version: 0.4.0
+version: 0.5.0
 author: leishu
 ---
 
@@ -31,7 +31,7 @@ author: leishu
 
 ```
 mail   (id, file, subject, mail_time, category, size_bytes,
-        tx_count, bill_amount, body_text, imported_at)
+        file_hash, tx_count, bill_amount, body_text, imported_at)
 tx     (id, mail_id, card, tx_date, tx_time, kind, channel, merchant,
         amount, sign, layout, state)          -- 仅人民币
 tx_fx  (id, mail_id, card, tx_date, tx_time, kind, channel, merchant,
@@ -104,7 +104,8 @@ SELECT year, merchant, total FROM (
 6. **时间以邮件内交易时间为准**，不是邮件发送时间。
 7. **`mail.tx_count` 不含 `hold`（但含 `tx_fx`）**：一封只发了预授权冻结的邮件 `tx_count = 0`，
    但它不是空邮件，查「有没有漏解析」时要把 `hold` 一起算进去。
-8. **数据可能缺月**：`get_overview` 里的 `data_quality` 会标出低覆盖月（如某月只有 3 笔），
+8. **数据可能缺月**：`get_overview` 里的 `data_quality` 会标出低覆盖月（如某月只有 3 笔）
+   和解析失败的邮件文件名（`parse_failed_files`，正常为空），
    回答趋势类问题时若用户问到的月份在名单里，要主动说明「该月邮件可能缺失」。
 9. **外币原币单列，不进人民币总额**：邮件里没有人民币折算金额，HKD 等交易存 `tx_fx`。
    `get_overview` 的 `foreign_currency` 按币种单报；`aggregate`/`top_merchants`/面板只统计 `tx`（CNY）。

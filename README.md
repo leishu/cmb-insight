@@ -294,7 +294,7 @@ cmb-insight/
 ├── SCHEMA.md                       数据库逐列说明（表/列/枚举/口径陷阱）
 ├── data/cmb.db                     SQLite 库（本地生成，不入库）
 ├── mcp/
-│   ├── db.py                       建表 + 导入 + 查询层（核心，schema v5）
+│   ├── db.py                       建表 + 导入 + 查询层（核心，schema v6）
 │   ├── cmb_parse.py                .eml → 交易记录（版式 A/B 解析）
 │   ├── server.py                   MCP 服务端（stdio，零依赖）
 │   ├── launch.sh                   启动器：探测 Python 解释器后 exec（macOS/Linux）
@@ -315,11 +315,14 @@ cmb-insight/
 # 首次全量导入（数千封约数十秒）
 python3 mcp/db.py ../招商银行 data/cmb.db
 
-# 增量导入：只处理新增或大小变化的邮件，其余跳过
+# 增量导入：按 文件名+大小+内容哈希 判断，只重导新增/变化的；目录里删掉的邮件自动清理
 python3 mcp/db.py ../招商银行 data/cmb.db
 
 # 全量重建
 python3 mcp/db.py ../招商银行 data/cmb.db --rebuild
+
+# 导入统计输出为纯 JSON（供脚本消费）
+python3 mcp/db.py ../招商银行 data/cmb.db --json
 
 # 看统计
 python3 mcp/db.py --stats data/cmb.db
@@ -339,7 +342,7 @@ python3 mcp/db.py --sql data/cmb.db "SELECT month, net_amount FROM v_monthly ORD
 
 ```
 mail(id, file, subject, mail_time, mail_date, category, size_bytes,
-     tx_count, bill_amount, body_text, imported_at)
+     file_hash, tx_count, bill_amount, body_text, imported_at)
 tx(id, mail_id, card, tx_date, tx_time, month, year, dow, hour,
    kind, channel, merchant, amount, sign, signed_amount, layout, state)
 tx_fx(id, mail_id, card, tx_date, tx_time, month, kind, channel, merchant,

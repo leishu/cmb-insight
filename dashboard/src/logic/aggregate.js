@@ -59,25 +59,25 @@ export function decode(payload) {
 /**
  * 环比/同比：取最近一个「完整月」与上月、去年同月比。
  *
- * 当月还没走完时（库内最后一笔不在月末）要跳过它，
- * 否则拿半个月去比整月，环比永远是大跌。
+ * 完整月口径与后端 compare_periods 一致：月末日期 ≤ 数据里最后一笔交易日期。
+ * 不能要求「月末当天恰好有交易」——月末那天没消费会把整个月误跳过。
+ * 当月还没走完时跳过它，否则拿半个月去比整月，环比永远是大跌。
  */
 export function periodCompare(rows) {
   const netByMonth = new Map()
-  const lastDay = new Map()
+  let lastTx = ''
   for (const r of rows) {
     if (!r.month) continue
     netByMonth.set(r.month, (netByMonth.get(r.month) || 0) + r.signed)
-    if (r.date > (lastDay.get(r.month) || '')) lastDay.set(r.month, r.date)
+    if (r.date > lastTx) lastTx = r.date
   }
   const months = [...netByMonth.keys()].sort()
   if (months.length < 2) return null
 
   const complete = (m) => {
     const [y, mo] = m.split('-').map(Number)
-    const days = new Date(y, mo, 0).getDate()
-    const last = lastDay.get(m)
-    return !!last && Number(last.slice(8, 10)) >= days
+    const end = `${m}-${String(new Date(y, mo, 0).getDate()).padStart(2, '0')}`
+    return !!lastTx && end <= lastTx
   }
 
   let idx = months.length - 1

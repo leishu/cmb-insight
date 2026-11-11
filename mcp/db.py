@@ -7,7 +7,9 @@
   ``tx_date``、``tx_time``、``amount``、``sign`` 自动推算，写入端不必维护。
 * ``tx_fts``：FTS5 + trigram 分词，支持中文子串检索（"星巴克"能命中
   "星巴克咖啡（国贸店）"）。unicode61 对中文整段当 token，不适用。
-* 增量导入：按文件名 + 文件大小判断是否需要重导；给出 ``--rebuild`` 可全量重建。
+* 增量导入：按文件名 + 大小 + 内容哈希判断是否需要重导；目录里已删除的邮件
+  会自动从库里清掉（仅限同一导入目录）；解析失败的邮件落 ``category='解析失败'``
+  行，体检指标不再空转。给出 ``--rebuild`` 可全量重建。
 * 商户别名归一放在导入末尾统一做一次（跨邮件合并被截断的商户名），
   保证增量导入与全量导入结果一致。
 
@@ -15,6 +17,7 @@
 ------
     python db.py <邮件目录> [数据库路径]          # 增量导入
     python db.py <邮件目录> [数据库路径] --rebuild  # 全量重建
+    python db.py <邮件目录> [数据库路径] --json     # 导入统计输出为 JSON
     python db.py --stats <数据库路径>              # 看统计
     python db.py --sql <数据库路径> "SELECT ..."    # 跑只读 SQL
 """
@@ -24,6 +27,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import html
+import json
 import os
 import re
 import sqlite3
@@ -42,7 +46,8 @@ DEFAULT_DB = os.path.join(PLUGIN_ROOT, "data", "cmb.db")
 # 库结构版本：变更表结构时 +1，导入时会自动全量重建（数据全部可由 .eml 复现）
 # v5: 交易日期改取正文「YYYY/MM/DD 消费」措辞（修复 2020–2021 发送日错位）；
 #     外币交易原币入库到 tx_fx，不再静默丢弃
-SCHEMA_VERSION = 5
+# v6: mail 增加 file_hash（内容级变更检测）；解析失败落库；增量清理已删邮件
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -58,6 +63,7 @@ CREATE TABLE IF NOT EXISTS mail (
     mail_date   TEXT GENERATED ALWAYS AS (substr(mail_time, 1, 10)) STORED,
     category    TEXT NOT NULL DEFAULT '',          -- 消费提醒 / 每日信用管家 / 自动还款 / 电子账单
     size_bytes  INTEGER NOT NULL DEFAULT 0,
+    file_hash   TEXT NOT NULL DEFAULT '',          -- 文件内容 sha1，增量导入检测同尺寸变更
     tx_count    INTEGER NOT NULL DEFAULT 0,
     bill_amount REAL,                              -- 自动还款通知的实扣金额（账单类走 bill 表）
     body_text   TEXT NOT NULL DEFAULT '',          -- 正文纯文本，供全文检索
@@ -343,9 +349,35 @@ def body_text_of(path: str, limit: int = 20000) -> str:
 # 导入
 # --------------------------------------------------------------------------- #
 
-def _existing_mails(conn: sqlite3.Connection) -> dict[str, int]:
-    return {r["file"]: r["size_bytes"]
-            for r in conn.execute("SELECT file, size_bytes FROM mail")}
+def _existing_mails(conn: sqlite3.Connection) -> dict[str, tuple]:
+    """file → (size_bytes, file_hash, category)，供增量导入判断跳过/重导。"""
+    return {r["file"]: (r["size_bytes"], r["file_hash"], r["category"])
+            for r in conn.execute("SELECT file, size_bytes, file_hash, category FROM mail")}
+
+
+def _file_hash(path: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha1(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _insert_failed_mail(conn: sqlite3.Connection, base: str, size: int,
+                        error: str) -> None:
+    """解析失败也落一行 mail：体检能数到、能溯源，下次导入会自动重试。"""
+    mail_time = ""
+    try:
+        mail_time = datetime.strptime(base[:15], "%Y%m%d-%H%M%S").strftime(
+            "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+    conn.execute(
+        """INSERT INTO mail (file, subject, mail_time, category, size_bytes,
+                             tx_count, bill_amount, body_text)
+           VALUES (?, '', ?, '解析失败', ?, 0, NULL, ?)""",
+        (base, mail_time, size, f"解析失败：{error}"[:2000]),
+    )
 
 
 def _delete_mail(conn: sqlite3.Connection, mail_id: int) -> None:
@@ -381,14 +413,15 @@ def _insert_credit(conn: sqlite3.Connection, mail_id: int, rec: dict) -> None:
     )
 
 
-def _insert_mail(conn: sqlite3.Connection, rec: dict, path: str) -> int:
+def _insert_mail(conn: sqlite3.Connection, rec: dict, path: str,
+                 file_hash: str = "") -> int:
     body = body_text_of(path)
     cur = conn.execute(
         """INSERT INTO mail (file, subject, mail_time, category, size_bytes,
-                             tx_count, bill_amount, body_text)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                             file_hash, tx_count, bill_amount, body_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (rec["file"], rec["subject"], rec["mail_time"], rec["category"],
-         rec["size"], rec["tx_count"], rec["repay_amount"], body),
+         rec["size"], file_hash, rec["tx_count"], rec["repay_amount"], body),
     )
     mail_id = cur.lastrowid
     rows, fx_rows, fts = [], [], []
@@ -509,7 +542,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
         init_schema(conn)
 
     existing = _existing_mails(conn)
-    added = updated = skipped = failed = 0
+    added = updated = skipped = failed = removed = 0
     started = datetime.now()
 
     for path in files:
@@ -517,19 +550,21 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
         try:
             size = os.path.getsize(path)
         except OSError:
-            failed += 1
-            continue
+            size = 0  # 文件可能刚被删/无权限，后面 parse 会失败并落「解析失败」行
 
-        if base in existing and not rebuild:
-            if existing[base] == size:
-                skipped += 1
-                continue
-            conn.execute("DELETE FROM tx_fts WHERE rowid IN "
-                         "(SELECT id FROM tx WHERE mail_id = "
-                         "(SELECT id FROM mail WHERE file = ?))", (base,))
-            conn.execute("DELETE FROM mail WHERE file = ?", (base,))
-            updated += 1
-        elif base in existing:
+        digest = ""
+        prev = existing.get(base)
+        if prev is not None and not rebuild:
+            prev_size, prev_hash, prev_cat = prev
+            # 解析失败行永远重试（解析器修好后能自动恢复）；其余按 大小+内容哈希 判断
+            if prev_size == size and prev_cat != "解析失败":
+                digest = _file_hash(path)
+                if digest and digest == prev_hash:
+                    skipped += 1
+                    continue
+            row = conn.execute("SELECT id FROM mail WHERE file = ?", (base,)).fetchone()
+            if row:
+                _delete_mail(conn, row[0])
             updated += 1
         else:
             added += 1
@@ -540,8 +575,21 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
             failed += 1
             if not quiet:
                 print(f"  解析失败 {base}: {exc}", file=sys.stderr)
+            _insert_failed_mail(conn, base, size, str(exc))
             continue
-        _insert_mail(conn, rec, path)
+        _insert_mail(conn, rec, path, digest or _file_hash(path))
+
+    # 清理目录里已删除的邮件：只在「导入目录 == 上次记录的目录」时做，
+    # 避免换个目录导入把旧目录的数据误删。全量重建后不存在陈旧行。
+    if not rebuild:
+        prev_dir = conn.execute(
+            "SELECT value FROM meta WHERE key = 'mail_dir'").fetchone()
+        if prev_dir and prev_dir[0] == os.path.abspath(mail_dir):
+            present = {os.path.basename(p) for p in files}
+            for r in conn.execute("SELECT id, file FROM mail").fetchall():
+                if r["file"] not in present:
+                    _delete_mail(conn, r["id"])
+                    removed += 1
 
     conn.commit()
     changed = normalize_merchants(conn)
@@ -583,6 +631,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
         "updated": updated,
         "skipped": skipped,
         "failed": failed,
+        "removed": removed,
         "merchant_merged": changed,
         "elapsed": round((datetime.now() - started).total_seconds(), 2),
     }
@@ -590,7 +639,7 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
     if not quiet:
         print(f"数据库：{info['db']}（{info['db_bytes'] / 1024 / 1024:.1f} MB）")
         print(f"邮件 {total_mail} 封 · 交易 {total_tx} 笔 · 外币 {total_fx} 笔 · 预授权 {total_hold} 笔 · 账单 {total_bill} 期")
-        print(f"新增 {added} · 更新 {updated} · 跳过 {skipped} · 失败 {failed} "
+        print(f"新增 {added} · 更新 {updated} · 跳过 {skipped} · 失败 {failed} · 清理 {removed} "
               f"· 商户名合并 {changed} 行 · 耗时 {info['elapsed']}s")
     return info
 
@@ -692,8 +741,13 @@ def coverage(conn: sqlite3.Connection) -> dict:
         "SELECT month, COUNT(*) n FROM tx GROUP BY month ORDER BY month")]
     counts = sorted(r["n"] for r in rows)
     median = counts[len(counts) // 2] if counts else 0
+    failed = conn.execute(
+        "SELECT COUNT(*) FROM mail WHERE category = '解析失败'").fetchone()[0]
+    failed_files = [r[0] for r in conn.execute(
+        "SELECT file FROM mail WHERE category = '解析失败' ORDER BY file LIMIT 20")]
     if not rows:
-        return {"months": 0, "missing_months": [], "low_months": []}
+        return {"months": 0, "missing_months": [], "low_months": [],
+                "parse_failed": failed, "parse_failed_files": failed_files}
     seen = {r["month"]: r["n"] for r in rows}
     all_months = _month_range(rows[0]["month"], rows[-1]["month"])
     threshold = max(3, int(median * 0.3))
@@ -706,8 +760,6 @@ def coverage(conn: sqlite3.Connection) -> dict:
     bill_missing = [m for m in all_months if m not in bill_months]
     no_tx = {r[0]: r[1] for r in conn.execute(
         "SELECT category, COUNT(*) FROM mail WHERE tx_count = 0 GROUP BY category")}
-    failed = conn.execute(
-        "SELECT COUNT(*) FROM mail WHERE category = '解析失败'").fetchone()[0]
     return {
         "months": len(all_months),
         "partial_month": latest,
@@ -718,6 +770,7 @@ def coverage(conn: sqlite3.Connection) -> dict:
         "bill_months": len(bill_months),
         "bill_missing_months": bill_missing,
         "parse_failed": failed,
+        "parse_failed_files": failed_files,
         "mails_without_tx": no_tx,
     }
 
@@ -950,6 +1003,12 @@ def compare_periods(conn: sqlite3.Connection, granularity: str = "month",
         return {"error": "该范围内没有交易数据"}
 
     labels = sorted(data)
+    # 数据截止日：传了 until 就以截断范围为准，否则截出来的半个月不会被标记 partial
+    if until:
+        last_tx = conn.execute(
+            "SELECT MAX(tx_date) FROM tx WHERE tx_date <= ?", (until,)).fetchone()[0] or ""
+    else:
+        last_tx = conn.execute("SELECT MAX(tx_date) FROM tx").fetchone()[0] or ""
     if current:
         cur_label = _normalize_period(current, granularity)
     else:
@@ -961,7 +1020,6 @@ def compare_periods(conn: sqlite3.Connection, granularity: str = "month",
     skipped = ""
     if not current and len(labels) > 1:
         _, cur_last_day = period_bounds(cur_label, granularity)
-        last_tx = conn.execute("SELECT MAX(tx_date) FROM tx").fetchone()[0] or ""
         if cur_label == labels[-1] and last_tx and cur_last_day > last_tx:
             skipped = cur_label
             cur_label = labels[-2]
@@ -974,8 +1032,7 @@ def compare_periods(conn: sqlite3.Connection, granularity: str = "month",
     base_missing = base_label not in data
     delta = round(cur["net"] - base["net"], 2)
 
-    # 当期是否还没走完：最后一天晚于库内最后一笔交易，就不能当完整周期比
-    last_tx = conn.execute("SELECT MAX(tx_date) FROM tx").fetchone()[0] or ""
+    # 当期是否还没走完：最后一天晚于数据截止日，就不能当完整周期比
     _, cur_last_day = period_bounds(cur_label, granularity)
     partial = bool(last_tx and cur_label in labels and cur_label == labels[-1]
                    and cur_last_day > last_tx)
@@ -1462,9 +1519,10 @@ def main(argv: list[str]) -> int:
     mail_dir = args[0] if args else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "..", "招商银行")
     db = args[1] if len(args) > 1 else DEFAULT_DB
-    info = import_dir(mail_dir, db, rebuild="--rebuild" in flags)
+    info = import_dir(mail_dir, db, rebuild="--rebuild" in flags,
+                      quiet="--json" in flags)
     if "--json" in flags:
-        print(hashlib.sha1(b"").hexdigest()[:0], info)
+        print(json.dumps(info, ensure_ascii=False))
     return 0
 
 

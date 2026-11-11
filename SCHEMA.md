@@ -1,10 +1,10 @@
-# 数据库结构说明（schema v5）
+# 数据库结构说明（schema v6）
 
 `data/cmb.db` —— SQLite，零外部依赖。所有数据都从 `.eml` 解析而来，**没有不可再生的人工录入**，
 所以库结构升级时直接全量重建，不会丢东西。
 
-- 建表 SQL：`mcp/db.py` 里的 `SCHEMA` 常量（第 47 行起）
-- 结构版本：`SCHEMA_VERSION = 5`（`db.py:45`），存在 `meta` 表里，**不是** `PRAGMA user_version`
+- 建表 SQL：`mcp/db.py` 里的 `SCHEMA` 常量（第 52 行起）
+- 结构版本：`SCHEMA_VERSION = 6`（`db.py:50`），存在 `meta` 表里，**不是** `PRAGMA user_version`
 - 写入者：`mcp/db.py`（导入层）、`mcp/cmb_parse.py`（抽取层，只产出 dict，不碰库）
 - 读取者：`mcp/server.py` 的 10 个 MCP 工具、`dashboard/` 面板
 
@@ -76,7 +76,8 @@
 | `mail_time` | TEXT | 邮件发出时间 `YYYY-MM-DD HH:MM:SS` | 优先取文件名前缀，失败退回 `Date` 头 |
 | `mail_date` | TEXT **生成列** | `substr(mail_time,1,10)` | 只读，别写 |
 | `category` | TEXT | 邮件类型，见下方枚举 | 由主题关键词判定，5 类 |
-| `size_bytes` | INTEGER | 文件字节数 | 增量导入时用来判断「内容变了」→ 删旧重插 |
+| `size_bytes` | INTEGER | 文件字节数 | 与 `file_hash` 一起判断「内容变了」→ 删旧重插 |
+| `file_hash` | TEXT | 文件内容 sha1 | v6 新增；同尺寸的内容变更也能检测到。解析失败行为空串 |
 | `tx_count` | INTEGER | 这封邮件解析出的交易行数（**`tx` + `tx_fx`**） | **不含 `hold`**；账单/还款类是 0，正常 |
 | `bill_amount` | REAL | 自动还款通知里的**实扣金额** | 只有「自动还款」这类邮件有值；账单类**不写这列**（走 `bill` 表） |
 | `body_text` | TEXT | 正文纯文本（上限 20,000 字符） | HTML 去标签；供全文检索与人工核对 |
@@ -91,7 +92,7 @@
 | `电子账单` | 主题含「电子账单」 | 每月一封 | **没有**，数据在 `bill` |
 | `自动还款` | 主题含「自动还款」 | 每月一封 | **没有**，只有 `bill_amount` |
 | `营销/其他` | 以上都不匹配 | 少量 | 没有（广告、通知） |
-| `解析失败` | 解析抛异常时的兜底值 | 正常为 0 | 没有 |
+| `解析失败` | 解析抛异常时落库（v6 起），`body_text` 存错误信息 | 正常为 0 | 没有；每次导入自动重试 |
 
 > 主题里不含这四个词的邮件一律进「营销/其他」，**不是**「无法识别的内容」。
 > 想确认广告邮件里有没有漏掉的真实消费，查 `category='营销/其他' and body_text not like '%活动%'`。
@@ -404,4 +405,4 @@ python3 mcp/db.py --stats data/cmb.db
 
 ---
 
-*最后更新：2026-11-10 · schema v5（新增 `tx_fx` 外币表；B 版式日期改取邮件内消费日期）*
+*最后更新：2026-11-10 · schema v6（`mail.file_hash` 内容级变更检测；解析失败落库；增量清理已删邮件）*

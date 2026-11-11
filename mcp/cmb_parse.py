@@ -552,14 +552,17 @@ def _normalize(mails: list[dict]) -> None:
 
 def build_index(mail_dir: str, cache_path: str | None = None) -> dict:
     files = sorted(glob.glob(os.path.join(mail_dir, "*.eml")))
-    mtimes = {}
+    # 签名覆盖「全部」文件的 名字+大小+mtime：只取最后几个文件的 mtime 时，
+    # 改动最旧的文件缓存照样命中（实测复现过）。全量 stat 三千封也只要几十毫秒。
+    stat = []
     for f in files:
         try:
-            mtimes[os.path.basename(f)] = os.path.getmtime(f)
+            st = os.stat(f)
+            stat.append([os.path.basename(f), st.st_size, st.st_mtime])
         except OSError:
             pass
     sig = hashlib.sha1(
-        json.dumps([len(files), sorted(mtimes.items())[-5:] if mtimes else []], sort_keys=True).encode()
+        json.dumps(sorted(stat), sort_keys=True).encode()
     ).hexdigest()
 
     if cache_path and os.path.exists(cache_path):
