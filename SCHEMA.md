@@ -156,7 +156,8 @@
 
 - **不进 FTS**：`tx_fts` 只索引 `tx`；`search_transactions` 对 `tx_fx` 用 LIKE 兜底（行数少，够快），
   返回的每条记录带 `currency` 字段，外币金额单独汇总在 `foreign_net`。
-- 商户名前缀合并（`normalize_merchants`）同时覆盖两张表。
+- 商户名前缀合并（`normalize_merchants`）覆盖 `tx` / `tx_fx` / `hold` 三张表，
+  别名规则与解析层共用 `cmb_parse.merchant_aliases`。
 - 聚合工具（`aggregate` / `top_merchants` / 面板）**只统计 `tx`**，外币要看 `get_overview` 或
   `search_transactions`，或自己写 SQL 查 `tx_fx`。
 

@@ -38,7 +38,7 @@ from datetime import date, datetime, timedelta
 # 允许作为脚本直接运行（python db.py ...）时同目录导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cmb_parse import parse_email  # noqa: E402
+from cmb_parse import parse_email, merchant_aliases  # noqa: E402
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(PLUGIN_ROOT, "data", "cmb.db")
@@ -475,35 +475,24 @@ def _insert_mail(conn: sqlite3.Connection, rec: dict, path: str,
 def normalize_merchants(conn: sqlite3.Connection) -> int:
     """跨邮件合并被上游截断的商户名（如「北京轨道交通路网管理有限」→ 全称）。
 
-    返回被改写的交易行数。规则：短名 >= 8 字且是长名前缀，长度差 <= 6。
+    返回被改写的行数（tx / tx_fx / hold 三张表）。别名规则与解析层共用
+    cmb_parse.merchant_aliases：短名 >= 8 字且是长名前缀，长度差 <= 6。
+    hold 也要覆盖：解析层只归一同批邮件，跨批次的截断要靠这里兜底。
     """
     names = [r[0] for r in conn.execute(
         "SELECT DISTINCT merchant FROM tx WHERE merchant <> '' "
-        "UNION SELECT DISTINCT merchant FROM tx_fx WHERE merchant <> ''")]
+        "UNION SELECT DISTINCT merchant FROM tx_fx WHERE merchant <> '' "
+        "UNION SELECT DISTINCT merchant FROM hold WHERE merchant <> ''")]
     if not names:
         return 0
-    alias: dict[str, str] = {}
-    ordered = sorted(names, key=len, reverse=True)
-    for long_name in ordered:
-        for short in names:
-            if short == long_name or short in alias:
-                continue
-            if len(short) >= 8 and long_name.startswith(short) \
-                    and len(long_name) - len(short) <= 6:
-                alias[short] = long_name
+    alias = merchant_aliases(names)
 
     changed = 0
-    for short, long_name in alias.items():
-        # 解链，避免 a→b、b→c 时只走一步
-        final = long_name
-        seen = {short}
-        while final in alias and final not in seen:
-            seen.add(final)
-            final = alias[final]
-        cur = conn.execute("UPDATE tx SET merchant = ? WHERE merchant = ?", (final, short))
-        changed += cur.rowcount
-        cur = conn.execute("UPDATE tx_fx SET merchant = ? WHERE merchant = ?", (final, short))
-        changed += cur.rowcount
+    for short, final in alias.items():
+        for table in ("tx", "tx_fx", "hold"):
+            cur = conn.execute(
+                f"UPDATE {table} SET merchant = ? WHERE merchant = ?", (final, short))
+            changed += cur.rowcount
     return changed
 
 
@@ -617,6 +606,10 @@ def import_dir(mail_dir: str, db_path: str = DEFAULT_DB, rebuild: bool = False,
          ("schema_version", str(SCHEMA_VERSION))],
     )
     conn.commit()
+
+    # WAL 里的数据还没落主文件时 getsize 会严重偏小（首导入常见 4096 字节），
+    # 先 checkpoint 再量，报告的才是真实库体积
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     info = {
         "db": os.path.abspath(db_path),
@@ -1301,7 +1294,7 @@ def top_merchants(conn: sqlite3.Connection, limit: int = 10, since=None,
         FROM tx t
         WHERE {where} AND t.merchant <> ''
         GROUP BY t.merchant
-        ORDER BY tx_count DESC
+        ORDER BY net_amount DESC, tx_count DESC
         LIMIT ?""", [*params, limit])
     return [dict(r) for r in rows]
 
@@ -1435,6 +1428,53 @@ def dashboard_payload(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _split_sql(sql: str) -> list[str]:
+    """按真实语句边界切分 SQL，返回去掉首尾空白的非空语句列表。
+
+    引号（' " ` [）内的分号、--、/* 都是字面量，不参与切分；
+    注释只在引号外识别。 doubled 引号（'' "" `` ]]）是转义，不结束引号。
+    用文本正则去注释再找 ';' 会把 `SELECT 'a;b'` 这类合法查询误判成多语句。
+    """
+    stmts, buf = [], []
+    i, n, quote = 0, len(sql), None
+    while i < n:
+        ch = sql[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                if i + 1 < n and sql[i + 1] == quote:  # 转义引号
+                    buf.append(sql[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"`[":
+            quote = "]" if ch == "[" else ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            i = n if j == -1 else j + 1
+            buf.append(" ")
+            continue
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            j = sql.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            buf.append(" ")
+            continue
+        if ch == ";":
+            stmts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    stmts.append("".join(buf))
+    return [s.strip() for s in stmts if s.strip()]
+
+
 def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
     """执行只读查询（仅 SELECT / WITH），返回列名与行。
 
@@ -1442,16 +1482,16 @@ def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
     RECURSIVE 动作，INSERT/UPDATE/DELETE/DDL/ATTACH/PRAGMA 一律拒绝。
     不做关键字黑名单——`INSERT\\nINTO` 这类换行变体能绕过文本匹配，
     而 `SELECT 'update t'` 这种合法字符串又会被误杀。
+    语句边界用 _split_sql 识别，字符串里的 ';' 不会误判成多语句。
     """
-    cleaned = re.sub(r"--[^\n]*", " ", sql)
-    cleaned = re.sub(r"/\*.*?\*/", " ", cleaned, flags=re.S).strip().rstrip(";").strip()
-    if not cleaned:
+    stmts = _split_sql(sql)
+    if not stmts:
         raise ValueError("SQL 为空")
-    head = cleaned.split(None, 1)[0].lower()
+    if len(stmts) > 1:
+        raise ValueError("一次只能执行一条语句")
+    head = stmts[0].split(None, 1)[0].lower()
     if head not in ("select", "with", "explain"):
         raise ValueError("只允许只读查询（SELECT / WITH）")
-    if ";" in cleaned:
-        raise ValueError("一次只能执行一条语句")
 
     allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
                getattr(sqlite3, "SQLITE_RECURSIVE", 33)}  # WITH RECURSIVE

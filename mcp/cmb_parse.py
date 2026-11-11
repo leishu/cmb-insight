@@ -527,6 +527,33 @@ def parse_email(path: str) -> dict:
     }
 
 
+def merchant_aliases(names) -> dict[str, str]:
+    """短名 → 最终长名 的别名表（解析与入库共用这一份规则）。
+
+    规则：短名 >= 8 字且是长名前缀，长度差 <= 6（银行截断商户名的典型形态）。
+    结果已解链：a→b、b→c 时直接映射到 c，调用方无需再追。
+    """
+    names = list(names)
+    alias: dict[str, str] = {}
+    # 次键按名字排序：同长度候选多个时，选择与输入顺序无关（解析层传的是 set）
+    ordered = sorted(names, key=lambda s: (-len(s), s))
+    for long_name in ordered:
+        for short in names:
+            if short == long_name or short in alias:
+                continue
+            if len(short) >= 8 and long_name.startswith(short) \
+                    and len(long_name) - len(short) <= 6:
+                alias[short] = long_name
+    for short in list(alias):
+        final = alias[short]
+        seen = {short}
+        while final in alias and final not in seen:
+            seen.add(final)
+            final = alias[final]
+        alias[short] = final
+    return alias
+
+
 def _normalize(mails: list[dict]) -> None:
     """合并被截断的商户名，并给退款打负号。"""
     names = set()
@@ -534,14 +561,7 @@ def _normalize(mails: list[dict]) -> None:
         for t in list(m["txs"]) + list(m.get("holds") or []):
             if t["merchant"]:
                 names.add(t["merchant"])
-    alias = {}
-    ordered = sorted(names, key=len, reverse=True)
-    for long_name in ordered:
-        for short in names:
-            if short == long_name or short in alias:
-                continue
-            if len(short) >= 8 and long_name.startswith(short) and len(long_name) - len(short) <= 6:
-                alias[short] = long_name
+    alias = merchant_aliases(names)
     for m in mails:
         for t in m["txs"]:
             t["merchant"] = alias.get(t["merchant"], t["merchant"])

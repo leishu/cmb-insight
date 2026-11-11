@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import sys
@@ -248,11 +249,20 @@ def dashboard_payload() -> dict:
     return db.dashboard_payload(conn())
 
 
-def _payload_uri() -> str:
-    row = conn().execute(
-        "SELECT COUNT(*) a, ROUND(COALESCE(SUM(signed_amount), 0), 2) b, MAX(tx_date) c FROM tx"
-    ).fetchone()
-    return f"{DASHBOARD_URI}?v={row['a']}-{int(row['b'])}-{row['c'] or ''}"
+def _payload_bytes(data: dict) -> bytes:
+    """面板载荷的规范序列化：渲染注入与缓存指纹共用同一份字节。"""
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"),
+                      sort_keys=True).encode("utf-8")
+
+
+def _payload_uri(data: dict) -> str:
+    """资源版本号取载荷内容的 sha1 指纹。
+
+    旧版只用 count-net-max_date：改商户名/渠道、修账单字段这类内容变化
+    三个值都不动，MCP App 会一直拿缓存的旧页面。内容指纹任何变化都能感知。
+    """
+    ver = hashlib.sha1(_payload_bytes(data)).hexdigest()[:12]
+    return f"{DASHBOARD_URI}?v={ver}"
 
 
 # --------------------------------------------------------------------------- #
@@ -430,9 +440,12 @@ def render_dashboard() -> str:
             "面板尚未构建。请先执行：cd cmb-insight/dashboard && npm install && npm run build")
     with open(DASHBOARD_HTML, encoding="utf-8") as fh:
         tpl = fh.read()
+    if "__CMB_DATA_B64__" not in tpl:
+        raise RuntimeError(
+            "面板模板缺少 __CMB_DATA_B64__ 占位符，注入会静默失效。"
+            "请重新构建：cd cmb-insight/dashboard && npm run build")
     payload = dashboard_payload()
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    blob = base64.b64encode(gzip.compress(raw, 9)).decode("ascii")
+    blob = base64.b64encode(gzip.compress(_payload_bytes(payload), 9)).decode("ascii")
     return tpl.replace("__CMB_DATA_B64__", blob)
 
 
@@ -586,7 +599,7 @@ def call_tool(name: str, args: dict) -> dict:
                                  f"渠道/商户筛选，点柱子下钻月份，或按「按月播放」看趋势演进。"}],
             "structuredContent": {"opened": True, "rows": len(data["txs"]),
                                   "focus": args.get("focus", "month")},
-            "_meta": {"ui": {"resourceUri": _payload_uri()}},
+            "_meta": {"ui": {"resourceUri": _payload_uri(data)}},
         }
     raise ValueError(f"未知工具: {name}")
 
